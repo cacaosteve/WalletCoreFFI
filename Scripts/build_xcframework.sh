@@ -4,6 +4,11 @@
 
 set -euo pipefail
 
+# Default Apple deployment targets (can be overridden by env)
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+export IPHONESIMULATOR_DEPLOYMENT_TARGET="${IPHONESIMULATOR_DEPLOYMENT_TARGET:-16.0}"
+
 # -----------------------------
 # Configuration and environment
 # -----------------------------
