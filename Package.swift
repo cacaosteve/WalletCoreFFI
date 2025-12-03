@@ -18,6 +18,12 @@
              path: "Artifacts/WalletCore.xcframework"
          ),
 
+         // Linux: system library target that links against libwalletcore.so (no pkgConfig/providers)
+         .systemLibrary(
+             name: "CLibWalletCore",
+             path: "CLibWalletCore"
+         ),
+
          // Thin Swift wrapper that conditionally links to the appropriate low-level target
          .target(
              name: "WalletCoreFFI",
