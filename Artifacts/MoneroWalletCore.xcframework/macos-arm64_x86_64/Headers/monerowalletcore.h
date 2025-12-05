@@ -124,6 +124,12 @@ int32_t wallet_open_from_mnemonic(
     uint8_t is_mainnet
 );
 
+/* Update the registered subaddress gap limit for scanning (minimum 1). */
+int32_t wallet_set_gap_limit(
+    const char* wallet_id,
+    uint32_t gap_limit
+);
+
 /*
  * Refresh the wallet against the daemon (node_url). On success, writes last_scanned height.
  * node_url may be NULL to use a default (env/localhost).
