@@ -1,5 +1,0 @@
-module WalletCore [system] {
-  header "walletcore.h"
-  export *
-  link "walletcore"
-}

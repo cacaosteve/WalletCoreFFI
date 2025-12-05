@@ -14,22 +14,23 @@
      targets: [
          // Apple platforms: prebuilt xcframework
          .binaryTarget(
-             name: "WalletCore",
-             path: "Artifacts/WalletCore.xcframework"
+             name: "MoneroWalletCore",
+             path: "Artifacts/MoneroWalletCore.xcframework"
          ),
 
-         // Linux: system library target that links against libwalletcore.so (no pkgConfig/providers)
+         // Linux: system library target that links against libwalletcore.so via pkg-config "walletcore"
          .systemLibrary(
-             name: "CLibWalletCore",
-             path: "CLibWalletCore"
+             name: "CLibMoneroWalletCore",
+             path: "CLibMoneroWalletCore",
+             pkgConfig: "walletcore"
          ),
 
          // Thin Swift wrapper that conditionally links to the appropriate low-level target
          .target(
              name: "MoneroWalletCoreFFI",
              dependencies: [
-                 .target(name: "WalletCore", condition: .when(platforms: [.iOS, .macOS])),
-                 .target(name: "CLibWalletCore", condition: .when(platforms: [.linux]))
+                 .target(name: "MoneroWalletCore", condition: .when(platforms: [.iOS, .macOS])),
+                 .target(name: "CLibMoneroWalletCore", condition: .when(platforms: [.linux]))
              ],
              path: "Sources/MoneroWalletCoreFFI",
              swiftSettings: [

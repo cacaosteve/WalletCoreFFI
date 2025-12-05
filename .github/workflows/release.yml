@@ -1,4 +1,4 @@
-name: Release WalletCore Artifacts
+name: Release MoneroWalletCore Artifacts
 
 on:
   push:
@@ -45,15 +45,15 @@ jobs:
       - name: Zip xcframework
         run: |
           cd "${ARTIFACTS_DIR}"
-          zip -r walletcore-xcframework.zip WalletCore.xcframework
+          zip -r monerowalletcore-xcframework.zip MoneroWalletCore.xcframework
           ls -lah .
         shell: bash
 
       - name: Upload artifact (xcframework)
         uses: actions/upload-artifact@v4
         with:
-          name: walletcore-xcframework
-          path: Artifacts/walletcore-xcframework.zip
+          name: monerowalletcore-xcframework
+          path: Artifacts/monerowalletcore-xcframework.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -107,7 +107,7 @@ jobs:
           ROOT="$PWD"
           CRATE_DIR="${CRATE_DIR}"
           OUT_DIR="${ROOT}/dist"
-          HEADER_SRC="${ROOT}/CLibWalletCore/walletcore.h"
+          HEADER_SRC="${ROOT}/CLibMoneroWalletCore/walletcore.h"
           mkdir -p "${OUT_DIR}"
 
           # Extract version from Cargo.toml
@@ -184,7 +184,7 @@ jobs:
       - name: Download xcframework artifact
         uses: actions/download-artifact@v4
         with:
-          name: walletcore-xcframework
+          name: monerowalletcore-xcframework
           path: .
 
       - name: Download linux-x86_64 artifact
@@ -209,6 +209,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            walletcore-xcframework.zip
+            monerowalletcore-xcframework.zip
             walletcore-linux-x86_64.tar.gz
             walletcore-linux-aarch64.tar.gz

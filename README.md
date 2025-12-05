@@ -1,8 +1,8 @@
-# WalletCoreFFI
+# MoneroWalletCoreFFI
 
 A cross‑platform Swift Package that exposes a safe Swift wrapper around a Rust Monero wallet core via a stable C ABI.
 
-- Apple (iOS + macOS): ships a prebuilt `WalletCore.xcframework` (binary target) so clients do not need Rust.
+- Apple (iOS + macOS): ships a prebuilt `MoneroWalletCore.xcframework` (binary target) so clients do not need Rust.
 - Linux (Vapor): links against a system‑installed `libwalletcore.so` (via `pkg-config`), so servers do not need Rust at build time either.
 
 This README explains how to add the package with SwiftPM on Apple platforms and how to set up Linux so Vapor apps “just work.”
@@ -10,7 +10,7 @@ This README explains how to add the package with SwiftPM on Apple platforms and 
 
 ## Supported platforms
 
-- iOS 15+
+- iOS 16+
 - macOS 13+
 - Linux (x86_64 and aarch64, tested on Ubuntu runners)
 
@@ -20,18 +20,18 @@ This README explains how to add the package with SwiftPM on Apple platforms and 
 You have two ways to consume this package:
 
 1) Apple (iOS and macOS) — Prebuilt xcframework (no Rust required)
-- The package contains `Artifacts/WalletCore.xcframework` and declares a binary target pointing to it.
+- The package contains `Artifacts/MoneroWalletCore.xcframework` and declares a binary target pointing to it.
 - When you add the package, SPM uses that xcframework directly.
 
 2) Linux (Vapor) — System library (no Rust required)
-- The package declares a `systemLibrary` target `CLibWalletCore` with `pkgConfig: "walletcore"`.
+- The package declares a `systemLibrary` target `CLibMoneroWalletCore` that links against an installed `libwalletcore.so`.
 - At build time, SPM asks `pkg-config` for headers and link flags and links your app against `libwalletcore.so` already installed on the system.
 
 
 ### iOS/macOS (Xcode)
 
 - File > Add Packages… and paste the repository URL (branch “main/master” or a specific revision).
-- Select the `WalletCoreFFI` library product.
+- Select the `MoneroWalletCoreFFI` library product.
 - That’s it — the xcframework is used automatically by SPM.
 
 Notes:
@@ -50,7 +50,7 @@ targets: [
     .target(
         name: "YourApp",
         dependencies: [
-            .product(name: "WalletCoreFFI", package: "repo-name")
+            .product(name: "MoneroWalletCoreFFI", package: "repo-name")
         ]
     )
 ]
@@ -72,14 +72,14 @@ A) System install (recommended; simplest with Docker/CI)
 Steps:
 1. Build the Rust library for your Linux target:
    ```
-   cd WalletCoreFFI/monero-oxide-output
+   cd MoneroWalletCoreFFI/monero-oxide-output
    cargo build --release --target x86_64-unknown-linux-gnu
    ```
    (Use `aarch64-unknown-linux-gnu` for ARM64 servers.)
 
 2. Install to the system (default prefix `/usr/local`):
    ```
-   cd WalletCoreFFI
+   cd MoneroWalletCoreFFI
    PREFIX=/usr/local TARGET=x86_64-unknown-linux-gnu ./Scripts/install_linux.sh
    sudo ldconfig  # update shared library cache
    ```
@@ -90,7 +90,7 @@ Steps:
    # Should print something like: -I/usr/local/include -L/usr/local/lib -lwalletcore
    ```
 
-4. Build your Vapor app that depends on `WalletCoreFFI`. SwiftPM will find the library via `pkg-config`.
+4. Build your Vapor app that depends on `MoneroWalletCoreFFI`. SwiftPM will find the library via `pkg-config`.
 
 B) Bake into your Docker image
 - Run the same install script in your Dockerfile (or copy the .so and header to `/usr/local` and write a minimal `walletcore.pc`).
@@ -100,17 +100,17 @@ B) Bake into your Docker image
 
    # Install build tools as needed…
    # Build & install libwalletcore.so
-   COPY WalletCoreFFI /opt/WalletCoreFFI
-   RUN cd /opt/WalletCoreFFI/monero-oxide-output && \
+   COPY MoneroWalletCoreFFI /opt/MoneroWalletCoreFFI
+   RUN cd /opt/MoneroWalletCoreFFI/monero-oxide-output && \
        cargo build --release --target x86_64-unknown-linux-gnu && \
-       cd /opt/WalletCoreFFI && \
+       cd /opt/MoneroWalletCoreFFI && \
        PREFIX=/usr/local TARGET=x86_64-unknown-linux-gnu ./Scripts/install_linux.sh && \
        ldconfig
 
-   # Now build your Vapor app which depends on WalletCoreFFI…
+   # Now build your Vapor app which depends on MoneroWalletCoreFFI…
    ```
 
-After this, any Vapor app that adds `WalletCoreFFI` via SPM will compile and link automatically on Linux (no vendored `.so` inside the app repo is required).
+After this, any Vapor app that adds `MoneroWalletCoreFFI` via SPM will compile and link automatically on Linux (no vendored `.so` inside the app repo is required).
 
 
 ## Can Linux be “automatic” like mac?
@@ -129,7 +129,7 @@ This approach is more fragile; system install (or a base image with the library 
 
 Open, refresh, and get balance:
 ```swift
-import WalletCoreFFI
+import MoneroWalletCoreFFI
 
 try WalletCoreFFIClient.openWalletFromMnemonic(
     walletId: "main_hot",
@@ -199,7 +199,7 @@ let address = try WalletCoreFFIClient.deriveAddressFromSeed(
 ## Scripts in this repo
 
 - `Scripts/build_xcframework.sh`
-  - Builds Apple static libs across supported Apple triples and packages `Artifacts/WalletCore.xcframework`.
+  - Builds Apple static libs across supported Apple triples and packages `Artifacts/MoneroWalletCore.xcframework`.
 - `Scripts/install_linux.sh`
   - Installs `libwalletcore.so`, `walletcore.h`, and `walletcore.pc` to a prefix (default `/usr/local`), and can be used in Docker/CI.
 
@@ -225,7 +225,7 @@ These scripts let you generate/update artifacts without manual Xcode/Rust setup 
 - “error while loading shared libraries: libwalletcore.so” at runtime (Linux)
   - Ensure the runtime loader can find it: `sudo ldconfig`, or set `LD_LIBRARY_PATH=/usr/local/lib` (or your prefix).
 
-- iOS/mac: “No such module WalletCoreFFI”
+- iOS/mac: “No such module MoneroWalletCoreFFI”
   - Make sure the package is added to the target’s dependencies and the project resolves package resources. The xcframework is included in the repo.
 
 

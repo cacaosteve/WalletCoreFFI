@@ -1,0 +1,5 @@
+module CLibMoneroWalletCore [system] {
+  header "walletcore.h"
+  link "walletcore"
+  export *
+}

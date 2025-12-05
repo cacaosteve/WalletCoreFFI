@@ -1,11 +1,11 @@
 import Foundation
 
-#if canImport(WalletCore)
-import WalletCore
-#elseif canImport(CLibWalletCore)
-import CLibWalletCore
+#if canImport(MoneroWalletCore)
+import MoneroWalletCore
+#elseif canImport(CLibMoneroWalletCore)
+import CLibMoneroWalletCore
 #else
-#error("WalletCoreFFI: Missing C module. Ensure the xcframework (Apple) or system library (Linux) is available.")
+#error("MoneroWalletCoreFFI: Missing C module. Ensure the xcframework (Apple) or system library (Linux) is available.")
 #endif
 
 /// Errors thrown by the Swift wrapper when the underlying FFI returns an error code or invalid data.

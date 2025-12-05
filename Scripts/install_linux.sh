@@ -29,7 +29,7 @@
 #   $ pkg-config --libs --cflags walletcore
 #
 # Notes:
-# - This script assumes it resides in WalletCoreFFI/Scripts/.
+# - This script assumes it resides in MoneroWalletCoreFFI/Scripts/.
 # - It will attempt to extract Version from monero-oxide-output/Cargo.toml.
 # - If installing to a system prefix, you may need to run with sudo.
 
@@ -43,7 +43,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
 CRATE_DIR="${REPO_ROOT}/monero-oxide-output"
-HEADER_DEFAULT="${REPO_ROOT}/CLibWalletCore/walletcore.h"
+HEADER_DEFAULT="${REPO_ROOT}/CLibMoneroWalletCore/walletcore.h"
 
 # ---------------
 # Defaults
@@ -242,7 +242,7 @@ echo "  • Update the shared library cache (if supported): sudo ldconfig"
 echo "  • Verify pkg-config: pkg-config --libs --cflags walletcore"
 echo
 echo "If your Swift package uses:"
-echo "  .systemLibrary(name: \"CLibWalletCore\", pkgConfig: \"walletcore\", providers: [...])"
+echo "  .systemLibrary(name: \"CLibMoneroWalletCore\", pkgConfig: \"walletcore\", providers: [...])"
 echo "Then SwiftPM should now be able to find and link libwalletcore on Linux."
 echo
 echo "Troubleshooting:"

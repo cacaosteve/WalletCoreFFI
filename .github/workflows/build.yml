@@ -1,4 +1,4 @@
-name: CI Build (WalletCore Artifacts)
+name: CI Build (MoneroWalletCore Artifacts)
 
 on:
   push:
@@ -47,7 +47,7 @@ jobs:
       - name: Zip xcframework
         run: |
           cd "${ARTIFACTS_DIR}"
-          zip -r walletcore-xcframework.zip WalletCore.xcframework
+          zip -r monerowalletcore-xcframework.zip MoneroWalletCore.xcframework
           ls -lah .
         shell: bash
 
@@ -59,8 +59,8 @@ jobs:
       - name: Upload artifact (xcframework)
         uses: actions/upload-artifact@v4
         with:
-          name: walletcore-xcframework-${{ github.sha }}
-          path: Artifacts/walletcore-xcframework.zip
+          name: monerowalletcore-xcframework-${{ github.sha }}
+          path: Artifacts/monerowalletcore-xcframework.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -114,7 +114,7 @@ jobs:
           ROOT="$PWD"
           CRATE_DIR="${CRATE_DIR}"
           OUT_DIR="${ROOT}/dist"
-          HEADER_SRC="${ROOT}/CLibWalletCore/walletcore.h"
+          HEADER_SRC="${ROOT}/CLibMoneroWalletCore/walletcore.h"
           mkdir -p "${OUT_DIR}"
 
           # Extract version from Cargo.toml (optional)

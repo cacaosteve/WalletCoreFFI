@@ -54,7 +54,7 @@ dist/
 Artifacts/*.zip
 
 # Note:
-# - Do NOT ignore Artifacts/WalletCore.xcframework (commit this if you want SPM
+# - Do NOT ignore Artifacts/MoneroWalletCore.xcframework (commit this if you want SPM
 #   to "just work" on Apple platforms).
 # - Linux servers should install libwalletcore.so via Scripts/install_linux.sh
 #   rather than committing .so files into app repos.

@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CRATE_DIR="${REPO_ROOT}/monero-oxide-output"
 OUT_DIR="${REPO_ROOT}/Artifacts"
-FRAMEWORK_NAME="WalletCore"
+FRAMEWORK_NAME="MoneroWalletCore"
 XCFRAMEWORK_PATH="${OUT_DIR}/${FRAMEWORK_NAME}.xcframework"
 
 # Build profile: release (default) or debug
@@ -30,7 +30,7 @@ RUSTUP_BIN="$(command -v rustup || true)"
 CARGO_BIN="$(command -v cargo || true)"
 
 # Header/modulemap
-HEADER_SRC="${REPO_ROOT}/CLibWalletCore/walletcore.h"
+HEADER_SRC="${REPO_ROOT}/CLibMoneroWalletCore/walletcore.h"
 
 # Targets to build (adjust as needed)
 APPLE_TARGETS=(
@@ -89,9 +89,9 @@ prepare_headers_dir() {
   # Copy the public header
   cp -f "${HEADER_SRC}" "${hdr_dir}/walletcore.h" || die "failed to copy walletcore.h"
 
-  # Generate a module.modulemap so Swift can import the C module as 'WalletCore'
+  # Generate a module.modulemap so Swift can import the C module as 'MoneroWalletCore'
   cat > "${hdr_dir}/module.modulemap" <<'EOF'
-module WalletCore [system] {
+module MoneroWalletCore [system] {
   header "walletcore.h"
   export *
   link "walletcore"
@@ -144,7 +144,7 @@ create_xcframework() {
 # Main
 # -----------------------------
 
-echo "== WalletCore xcframework build =="
+echo "== MoneroWalletCore xcframework build =="
 echo "  - Repo root: ${REPO_ROOT}"
 echo "  - Crate dir: ${CRATE_DIR}"
 echo "  - Output dir: ${OUT_DIR}"
@@ -213,6 +213,6 @@ echo "== Done =="
 echo "Generated: ${XCFRAMEWORK_PATH}"
 echo ""
 echo "To use in Package.swift:"
-echo "  .binaryTarget(name: \"WalletCore\", path: \"Artifacts/WalletCore.xcframework\")"
+echo "  .binaryTarget(name: \"MoneroWalletCore\", path: \"Artifacts/MoneroWalletCore.xcframework\")"
 echo ""
-echo "Tip: commit Artifacts/WalletCore.xcframework, or publish via a release and point SPM to the URL."
+echo "Tip: commit Artifacts/MoneroWalletCore.xcframework, or publish via a release and point SPM to the URL."
