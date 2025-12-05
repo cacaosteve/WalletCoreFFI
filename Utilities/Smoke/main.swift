@@ -1,5 +1,5 @@
 import Foundation
-import WalletCoreFFI
+import MoneroWalletCoreFFI
 
 @main
 struct Smoke {
@@ -29,8 +29,8 @@ struct Smoke {
             }
         }()
 
-        print("==== WalletCoreFFI Smoke Test ====")
-        print("- Version: \(WalletCoreFFIClient.version())")
+        print("==== MoneroWalletCoreFFI Smoke Test ====")
+        print("- Version: \(MoneroWalletCoreFFIClient.version())")
         print("- Wallet ID: \(walletId)")
         print("- Network: \(mainnet ? "mainnet" : "stagenet")")
         print("- Restore height: \(restoreHeight)")
@@ -38,7 +38,7 @@ struct Smoke {
 
         do {
             // 1) Open/register wallet
-            try WalletCoreFFIClient.openWalletFromMnemonic(
+            try MoneroWalletCoreFFIClient.openWalletFromMnemonic(
                 walletId: walletId,
                 mnemonic: mnemonic,
                 restoreHeight: restoreHeight,
@@ -47,18 +47,18 @@ struct Smoke {
             print("✔ openWalletFromMnemonic: OK")
 
             // 2) Refresh wallet
-            let lastScanned = try WalletCoreFFIClient.refreshWallet(walletId: walletId, nodeURL: nodeURL)
+            let lastScanned = try MoneroWalletCoreFFIClient.refreshWallet(walletId: walletId, nodeURL: nodeURL)
             print("✔ refreshWallet: OK (lastScanned=\(lastScanned))")
 
             // 3) Get balances
-            let (total, unlocked) = try WalletCoreFFIClient.getBalance(walletId: walletId)
+            let (total, unlocked) = try MoneroWalletCoreFFIClient.getBalance(walletId: walletId)
             print("✔ getBalance: total=\(total) piconero, unlocked=\(unlocked) piconero")
 
             print("==== Smoke Test Succeeded ====")
             exit(EXIT_SUCCESS)
         } catch {
             print("✖ Smoke Test Failed: \(error.localizedDescription)")
-            if let err = error as? WalletCoreFFIError {
+            if let err = error as? MoneroWalletCoreFFIError {
                 switch err {
                 case .core(let msg): print("Core error: \(msg)")
                 case .nullPointer(let msg): print("Null pointer: \(msg)")
@@ -86,7 +86,7 @@ struct Smoke {
           WALLET_RESTORE_HEIGHT=3000000 \\
           MONERO_URL=http://127.0.0.1:38081 \\
           STAGENET=1 \\
-          swift run WalletCoreFFI_Smoke
+          swift run MoneroWalletCoreFFI_Smoke
 
         """
         fputs(usage + "\n", stderr)
