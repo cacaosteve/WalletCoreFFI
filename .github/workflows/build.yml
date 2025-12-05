@@ -64,8 +64,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build_linux:
-    name: Build Linux .so (x86_64 + aarch64)
+  build_linux_x86_64:
+    name: Build Linux .so (x86_64)
     runs-on: ubuntu-latest
 
     steps:
@@ -74,16 +74,6 @@ jobs:
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: Install cross compiler for aarch64
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross linux-libc-dev-arm64-cross
-        shell: bash
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -103,36 +93,7 @@ jobs:
           ls -lah "target/x86_64-unknown-linux-gnu/release" || true
         shell: bash
 
-      - name: Build aarch64-unknown-linux-gnu (release)
-        working-directory: ${{ env.CRATE_DIR }}
-        env:
-          SYSROOT: /usr/aarch64-linux-gnu
-          CC: aarch64-linux-gnu-gcc
-          AR: aarch64-linux-gnu-ar
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          CC_aarch64-unknown-linux-gnu: aarch64-linux-gnu-gcc
-          AR_aarch64-unknown-linux-gnu: aarch64-linux-gnu-ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CROSS_COMPILE: aarch64-linux-gnu-
-          CPATH: /usr/aarch64-linux-gnu/include:/usr/include/aarch64-linux-gnu
-          CFLAGS: --sysroot=/usr/aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include -I/usr/include/aarch64-linux-gnu
-          CPPFLAGS: --sysroot=/usr/aarch64-linux-gnu
-          CFLAGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include -I/usr/include/aarch64-linux-gnu
-          CPPFLAGS_aarch64_unknown_linux_gnu: --sysroot=/usr/aarch64-linux-gnu
-          CFLAGS_aarch64-unknown-linux-gnu: --sysroot=/usr/aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include -I/usr/include/aarch64-linux-gnu
-          CPPFLAGS_aarch64-unknown-linux-gnu: --sysroot=/usr/aarch64-linux-gnu
-          C_INCLUDE_PATH: /usr/aarch64-linux-gnu/include
-          CPLUS_INCLUDE_PATH: /usr/aarch64-linux-gnu/include
-          LIBRARY_PATH: /usr/aarch64-linux-gnu/lib:/usr/aarch64-linux-gnu/lib64:/usr/lib/aarch64-linux-gnu
-          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
-          PKG_CONFIG_LIBDIR: /usr/aarch64-linux-gnu/lib/pkgconfig:/usr/aarch64-linux-gnu/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu
-          ls -lah "target/aarch64-unknown-linux-gnu/release" || true
-        shell: bash
-
-      - name: Package artifacts (tarballs)
+      - name: Package artifact (x86_64)
         run: |
           set -euo pipefail
           ROOT="$PWD"
@@ -141,7 +102,6 @@ jobs:
           HEADER_SRC="${ROOT}/CLibMoneroWalletCore/monerowalletcore.h"
           mkdir -p "${OUT_DIR}"
 
-          # Extract version from Cargo.toml (optional)
           VERSION="$(awk '
             /^\[package\]/ { inpkg=1; next }
             /^\[/ { inpkg=0 }
@@ -152,7 +112,6 @@ jobs:
           ' "${CRATE_DIR}/Cargo.toml")"
           VERSION="${VERSION:-0.0.0}"
 
-          # pkg-config template
           pc_gen() {
             cat <<EOF
           prefix=/usr/local
@@ -167,7 +126,6 @@ jobs:
           EOF
           }
 
-          # x86_64 bundle
           X86_LIB="${CRATE_DIR}/target/x86_64-unknown-linux-gnu/release/libmonerowalletcore.so"
           X86_DIR="${OUT_DIR}/monerowalletcore-linux-x86_64"
           mkdir -p "${X86_DIR}"
@@ -175,15 +133,6 @@ jobs:
           cp -f "${HEADER_SRC}" "${X86_DIR}/monerowalletcore.h"
           pc_gen > "${X86_DIR}/monerowalletcore.pc"
           tar -C "${OUT_DIR}" -czf "${OUT_DIR}/monerowalletcore-linux-x86_64.tar.gz" "monerowalletcore-linux-x86_64"
-
-          # aarch64 bundle
-          ARM_LIB="${CRATE_DIR}/target/aarch64-unknown-linux-gnu/release/libmonerowalletcore.so"
-          ARM_DIR="${OUT_DIR}/monerowalletcore-linux-aarch64"
-          mkdir -p "${ARM_DIR}"
-          cp -f "${ARM_LIB}" "${ARM_DIR}/libmonerowalletcore.so"
-          cp -f "${HEADER_SRC}" "${ARM_DIR}/monerowalletcore.h"
-          pc_gen > "${ARM_DIR}/monerowalletcore.pc"
-          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/monerowalletcore-linux-aarch64.tar.gz" "monerowalletcore-linux-aarch64"
 
           ls -lah "${OUT_DIR}"
         shell: bash
@@ -196,8 +145,88 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build_linux_arm64:
+    name: Build Linux .so (aarch64)
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.CRATE_DIR }}/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles(format('{0}/Cargo.lock', env.CRATE_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build aarch64-unknown-linux-gnu (release)
+        working-directory: ${{ env.CRATE_DIR }}
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+          ls -lah "target/aarch64-unknown-linux-gnu/release" || true
+        shell: bash
+
+      - name: Package artifact (aarch64)
+        run: |
+          set -euo pipefail
+          ROOT="$PWD"
+          CRATE_DIR="${CRATE_DIR}"
+          OUT_DIR="${ROOT}/dist"
+          HEADER_SRC="${ROOT}/CLibMoneroWalletCore/monerowalletcore.h"
+          mkdir -p "${OUT_DIR}"
+
+          VERSION="$(awk '
+            /^\[package\]/ { inpkg=1; next }
+            /^\[/ { inpkg=0 }
+            inpkg && $1 ~ /^version/ {
+              match($0, /version *= *"([^"]+)"/, m)
+              if (m[1] != "") { print m[1]; exit 0 }
+            }
+          ' "${CRATE_DIR}/Cargo.toml")"
+          VERSION="${VERSION:-0.0.0}"
+
+          pc_gen() {
+            cat <<EOF
+          prefix=/usr/local
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: monerowalletcore
+          Description: Monero WalletCore FFI
+          Version: ${VERSION}
+          Libs: -L\${libdir} -lmonerowalletcore
+          Cflags: -I\${includedir}
+          EOF
+          }
+
+          ARM_LIB="${CRATE_DIR}/target/aarch64-unknown-linux-gnu/release/libmonerowalletcore.so"
+          ARM_DIR="${OUT_DIR}/monerowalletcore-linux-aarch64"
+          mkdir -p "${ARM_DIR}"
+          cp -f "${ARM_LIB}" "${ARM_DIR}/libmonerowalletcore.so"
+          cp -f "${HEADER_SRC}" "${ARM_DIR}/monerowalletcore.h"
+          pc_gen > "${ARM_DIR}/monerowalletcore.pc"
+          tar -C "${OUT_DIR}" -czf "${OUT_DIR}/monerowalletcore-linux-aarch64.tar.gz" "monerowalletcore-linux-aarch64"
+
+          ls -lah "${OUT_DIR}"
+        shell: bash
+
       - name: Upload artifact (linux-aarch64)
         uses: actions/upload-artifact@v4
+        with:
+          name: monerowalletcore-linux-aarch64-${{ github.sha }}
+          path: dist/monerowalletcore-linux-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
         with:
           name: monerowalletcore-linux-aarch64-${{ github.sha }}
           path: dist/monerowalletcore-linux-aarch64.tar.gz
