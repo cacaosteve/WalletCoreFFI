@@ -106,11 +106,23 @@ jobs:
       - name: Build aarch64-unknown-linux-gnu (release)
         working-directory: ${{ env.CRATE_DIR }}
         run: |
+          # Target toolchain and sysroot
+          export SYSROOT=/usr/aarch64-linux-gnu
+          export CC=aarch64-linux-gnu-gcc
+          export AR=aarch64-linux-gnu-ar
           export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          export CFLAGS_aarch64_unknown_linux_gnu="--sysroot=/usr/aarch64-linux-gnu"
-          export PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
+          # Make sure the cross headers/libs are found
+          export CFLAGS="--sysroot=${SYSROOT}"
+          export CPPFLAGS="--sysroot=${SYSROOT}"
+          export CFLAGS_aarch64_unknown_linux_gnu="--sysroot=${SYSROOT}"
+          export CPPFLAGS_aarch64_unknown_linux_gnu="--sysroot=${SYSROOT}"
+          export C_INCLUDE_PATH="${SYSROOT}/include"
+          export CPLUS_INCLUDE_PATH="${SYSROOT}/include"
+          export LIBRARY_PATH="${SYSROOT}/lib:${SYSROOT}/lib64:/usr/lib/aarch64-linux-gnu"
+          export PKG_CONFIG_SYSROOT_DIR="${SYSROOT}"
+          export PKG_CONFIG_LIBDIR="${SYSROOT}/lib/pkgconfig:${SYSROOT}/share/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig"
           cargo build --release --target aarch64-unknown-linux-gnu
           ls -lah "target/aarch64-unknown-linux-gnu/release" || true
         shell: bash
