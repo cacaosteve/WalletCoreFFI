@@ -80,7 +80,7 @@ jobs:
       - name: Install cross compiler for aarch64
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
         shell: bash
 
       - name: Cargo cache
