@@ -128,6 +128,21 @@ public enum WalletCoreFFIClient {
         try checkRC(rc, context: "wallet_open_from_mnemonic")
     }
 
+    public static func setGapLimit(
+        walletId: String,
+        gapLimit: UInt32
+    ) throws {
+#if canImport(CLibMoneroWalletCore)
+        let rc = walletId.withCString { cId in
+            wallet_set_gap_limit(cId, gapLimit)
+        }
+        try checkRC(rc, context: "wallet_set_gap_limit")
+#else
+        _ = walletId
+        _ = gapLimit
+#endif
+    }
+
     /// Refresh the wallet against the daemon (nodeURL). Returns the last scanned height.
     public static func refreshWallet(
         walletId: String,

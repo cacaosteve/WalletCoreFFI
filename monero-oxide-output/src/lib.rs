@@ -908,6 +908,39 @@ pub extern "C" fn wallet_open_from_mnemonic(
 }
 
 #[no_mangle]
+pub extern "C" fn wallet_set_gap_limit(wallet_id: *const c_char, gap_limit: u32) -> c_int {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        return record_error(-11, "wallet_set_gap_limit: wallet_id pointer was null");
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_set_gap_limit: wallet_id contained invalid UTF-8",
+            )
+        }
+    };
+
+    let normalized = gap_limit.clamp(1, 100_000);
+    let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+    match map.get_mut(id) {
+        Some(state) => {
+            state.gap_limit = normalized;
+            clear_last_error();
+            0
+        }
+        None => record_error(
+            -13,
+            format!("wallet_set_gap_limit: wallet '{id}' not opened"),
+        ),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn wallet_refresh(
     wallet_id: *const c_char,
     node_url: *const c_char,
