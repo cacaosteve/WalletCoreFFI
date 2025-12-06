@@ -63,6 +63,23 @@ fn record_error(code: c_int, message: impl Into<String>) -> c_int {
     code
 }
 
+fn update_scan_progress(
+    id: &str,
+    scanned_height: u64,
+    chain_height: u64,
+    chain_time: u64,
+    restore_height: u64,
+) {
+    if let Ok(mut map) = WALLET_STORE.lock() {
+        if let Some(state) = map.get_mut(id) {
+            let normalized_scanned = scanned_height.max(restore_height).min(chain_height);
+            state.last_scanned = normalized_scanned;
+            state.chain_height = chain_height;
+            state.chain_time = chain_time;
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
     let snapshot = LAST_ERROR_MESSAGE
@@ -1267,6 +1284,13 @@ pub extern "C" fn wallet_refresh(
     let mut working_outputs = snapshot.tracked_outputs.clone();
     let mut seen_outpoints = snapshot.seen_outpoints.clone();
     let mut scan_cursor = snapshot.last_scanned.max(snapshot.restore_height);
+    update_scan_progress(
+        id,
+        scan_cursor.min(daemon.height),
+        daemon.height,
+        daemon.top_block_timestamp,
+        snapshot.restore_height,
+    );
 
     // Optional performance logging controls
     let log_perf: bool = std::env::var("WALLETCORE_SCAN_LOG")
@@ -1420,6 +1444,13 @@ pub extern "C" fn wallet_refresh(
 
                 // Advance cursor to end of this batch
                 scan_cursor = end_exclusive;
+                update_scan_progress(
+                    id,
+                    scan_cursor.min(daemon.height),
+                    daemon.height,
+                    daemon.top_block_timestamp,
+                    snapshot.restore_height,
+                );
             }
             // Ensure we align with daemon height after finishing batches
             scan_cursor = daemon.height;
@@ -1485,6 +1516,13 @@ pub extern "C" fn wallet_refresh(
                 }
 
                 scan_cursor += 1;
+                update_scan_progress(
+                    id,
+                    scan_cursor.min(daemon.height),
+                    daemon.height,
+                    daemon.top_block_timestamp,
+                    snapshot.restore_height,
+                );
             }
             scan_cursor = daemon.height;
         }
