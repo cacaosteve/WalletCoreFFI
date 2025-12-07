@@ -39,7 +39,7 @@ public enum WalletCoreFFIClient {
 
     /// Reads the last error message from the core, if any.
     /// This does NOT attempt to free the returned pointer, since implementations may return a static string.
-    private static func lastErrorMessage() -> String? {
+    public static func lastErrorMessage() -> String? {
         guard let cstr = walletcore_last_error_message() else { return nil }
         let s = String(cString: cstr)
         _ = walletcore_free_cstr(cstr)
