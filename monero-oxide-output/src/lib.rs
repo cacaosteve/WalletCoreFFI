@@ -363,11 +363,22 @@ impl BlockingRpcTransport {
         if base_url.is_empty() {
             return Err(-14);
         }
-        let agent = Arc::new(
-            ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(30))
-                .build(),
-        );
+
+        // Build an HTTP client, optionally honoring proxy env vars (HTTP_PROXY/http_proxy/ALL_PROXY/all_proxy)
+        let mut builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(30));
+
+        if let Ok(proxy) = std::env::var("HTTP_PROXY")
+            .or_else(|_| std::env::var("http_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .or_else(|_| std::env::var("all_proxy"))
+        {
+            if let Ok(px) = ureq::Proxy::new(&proxy) {
+                builder = builder.proxy(px);
+            }
+        }
+
+        let agent = Arc::new(builder.build());
+
         Ok(Self {
             agent,
             base_url,
