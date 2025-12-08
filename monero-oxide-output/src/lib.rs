@@ -1432,9 +1432,11 @@ pub extern "C" fn wallet_refresh(
                         });
                     }
 
-                    // Drain results for this chunk
-                    for _ in 0..chunk.len() {
-                        match rx.recv() {
+                    // Drain results for this chunk with timeout to prevent deadlock if a worker stalls
+                    let mut received = 0usize;
+                    let worker_timeout = std::time::Duration::from_secs(120);
+                    while received < chunk.len() {
+                        match rx.recv_timeout(worker_timeout) {
                             Ok(Ok(vec_outputs)) => {
                                 for t in vec_outputs {
                                     let key = (t.tx_hash, t.index_in_tx);
@@ -1443,12 +1445,24 @@ pub extern "C" fn wallet_refresh(
                                     }
                                     working_outputs.push(t);
                                 }
+                                received += 1;
                             }
                             Ok(Err((code, msg))) => {
                                 // Abort on first error
                                 return record_error(code, msg);
                             }
-                            Err(_) => {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                return record_error(
+                                    -16,
+                                    format!(
+                                        "wallet_refresh: parallel worker stalled (no result within {}s) while scanning heights {}..{}",
+                                        worker_timeout.as_secs(),
+                                        scan_cursor,
+                                        end_exclusive.saturating_sub(1)
+                                    ),
+                                );
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                 return record_error(
                                     -16,
                                     "wallet_refresh: parallel worker channel closed unexpectedly",
