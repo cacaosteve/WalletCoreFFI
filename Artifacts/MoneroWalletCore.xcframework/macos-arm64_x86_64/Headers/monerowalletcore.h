@@ -240,6 +240,12 @@ char* wallet_preview_fee_with_filter(
     uint8_t ring_len
 );
 
+/* Force rescan from a given restore height (resets cache/state). */
+int32_t wallet_force_rescan_from_height(
+    const char* wallet_id,
+    uint64_t new_restore_height
+);
+
 WALLETCORE_EXTERN_C_END
 
 #endif /* MONEROWALLETCORE_H */
