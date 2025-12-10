@@ -163,15 +163,10 @@ public enum WalletCoreFFIClient {
         walletId: String,
         fromHeight: UInt64
     ) throws {
-#if canImport(CLibMoneroWalletCore)
         let rc = walletId.withCString { cId in
             wallet_force_rescan_from_height(cId, fromHeight)
         }
         try checkRC(rc, context: "wallet_force_rescan_from_height")
-#else
-        _ = walletId
-        _ = fromHeight
-#endif
     }
 
     public static func startZmqListener(endpoint: String) throws {
