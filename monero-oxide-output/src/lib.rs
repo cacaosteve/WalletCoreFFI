@@ -1288,12 +1288,23 @@ pub extern "C" fn wallet_refresh(
 
     let mut scanner = Scanner::new(view_pair.clone());
     let gap_limit = snapshot.gap_limit.max(1);
-    if let Some(i0) = SubaddressIndex::new(0, 0) {
-        scanner.register_subaddress(i0);
-    }
-    for minor in 1..=gap_limit {
-        if let Some(index) = SubaddressIndex::new(0, minor) {
-            scanner.register_subaddress(index);
+    // Major account lookahead: default 1 (account 0 only); configurable via WALLETCORE_ACCOUNT_GAP
+    let account_gap: u32 = std::env::var("WALLETCORE_ACCOUNT_GAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(1);
+
+    // Register subaddresses across accounts and subaddresses:
+    // major: [0, account_gap), minor: [0, gap_limit]
+    for major in 0..account_gap {
+        if let Some(idx0) = SubaddressIndex::new(major, 0) {
+            scanner.register_subaddress(idx0);
+        }
+        for minor in 1..=gap_limit {
+            if let Some(idx) = SubaddressIndex::new(major, minor) {
+                scanner.register_subaddress(idx);
+            }
         }
     }
 
