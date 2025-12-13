@@ -2041,6 +2041,42 @@ pub extern "C" fn wallet_export_outputs_json(wallet_id: *const c_char) -> *mut c
 }
 
 #[no_mangle]
+pub extern "C" fn wallet_preview_sweep(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_preview_sweep: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    // No filter (whole wallet)
+    wallet_preview_sweep_with_filter(wallet_id, node_url, to_address, ptr::null(), ring_len)
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_sweep(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_sweep: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    // No filter (whole wallet)
+    wallet_sweep_with_filter(wallet_id, node_url, to_address, ptr::null(), ring_len)
+}
+
+#[no_mangle]
 pub extern "C" fn wallet_send(
     wallet_id: *const c_char,
     node_url: *const c_char,
@@ -2169,32 +2205,184 @@ pub extern "C" fn wallet_send(
     // Sort by amount ascending to minimize change fragmentation
     spendable.sort_by_key(|o| o.amount);
 
-    let mut selected_tracked: Vec<TrackedOutput> = Vec::new();
-    let mut accumulated: u64 = 0;
-
-    for o in spendable {
-        selected_tracked.push(o.clone());
-        accumulated = accumulated.saturating_add(o.amount);
-        if accumulated >= amount_piconero {
-            break;
-        }
-    }
-
-    if accumulated < amount_piconero {
-        record_error(
-            -18,
-            format!(
-                "wallet_send: insufficient unlocked funds (have {}, need {})",
-                accumulated, amount_piconero
-            ),
-        );
-        return ptr::null_mut();
-    }
-
-    // Reconstruct WalletOutput for each selected TrackedOutput by rescanning its block
+    // We must select enough to cover (amount + fee). Fee depends on input count, so iterate.
     let mut rng = OsRng;
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
 
+    // Fetch fee rate once
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_send: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    // Change to primary account (no explicit subaddress)
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+
+    let mut selected_tracked: Vec<TrackedOutput> = Vec::new();
+    let mut selected_sum: u64 = 0;
+
+    let max_selection_rounds: usize = 24;
+
+    for _round in 0..max_selection_rounds {
+        if selected_tracked.is_empty() {
+            for o in &spendable {
+                selected_tracked.push(o.clone());
+                selected_sum = selected_sum.saturating_add(o.amount);
+                if selected_sum >= amount_piconero {
+                    break;
+                }
+            }
+
+            if selected_sum < amount_piconero {
+                record_error(
+                    -18,
+                    format!(
+                        "wallet_send: insufficient unlocked funds (have {}, need {})",
+                        selected_sum, amount_piconero
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        }
+
+        // Reconstruct WalletOutput for each selected TrackedOutput by rescanning its block
+        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        for t in &selected_tracked {
+            let block_number = match usize::try_from(t.block_height) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_error(-16, "wallet_send: block number conversion overflow");
+                    return ptr::null_mut();
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    record_error(
+                        -16,
+                        format!("wallet_send: scanner failed at height {}", t.block_height),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            // Find the exact WalletOutput matching (tx_hash, index)
+            let maybe_out = outputs.into_iter().find(|wo| {
+                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
+            });
+
+            let wallet_out = match maybe_out {
+                Some(wo) => wo,
+                None => {
+                    record_error(
+                        -16,
+                        "wallet_send: failed to reconstruct selected output (not found after scan)",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(code, "wallet_send: decoy selection failed");
+                    return ptr::null_mut();
+                }
+            };
+
+            inputs.push(with_decoys);
+        }
+
+        // Outgoing view key seed for RNGs
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        // Build signable transaction
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs,
+            vec![(recipient_address, amount_piconero)],
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                record_error(
+                    -16,
+                    format!("wallet_send: transaction construction failed ({e})"),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let fee_piconero = intent.necessary_fee();
+        let needed_total = amount_piconero.saturating_add(fee_piconero);
+
+        if selected_sum >= needed_total {
+            // We have enough inputs to cover amount + fee; proceed with signing/broadcast below.
+            // (fee_piconero is used later in the function)
+            break;
+        }
+
+        // Otherwise, select more inputs and retry (fee may increase with more inputs).
+        let mut added_any = false;
+        for o in &spendable {
+            if selected_tracked
+                .iter()
+                .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+            {
+                continue;
+            }
+            selected_tracked.push(o.clone());
+            selected_sum = selected_sum.saturating_add(o.amount);
+            added_any = true;
+            if selected_sum >= needed_total {
+                break;
+            }
+        }
+
+        if !added_any {
+            record_error(
+                -18,
+                format!(
+                    "wallet_send: insufficient unlocked funds for amount+fee (have {}, need {})",
+                    selected_sum, needed_total
+                ),
+            );
+            return ptr::null_mut();
+        }
+    }
+
+    // Rebuild intent one last time using final selection so `intent` and `fee_piconero` are in-scope
+    // and match the actual transaction we sign/broadcast.
     let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
     for t in &selected_tracked {
         let block_number = match usize::try_from(t.block_height) {
@@ -2230,7 +2418,6 @@ pub extern "C" fn wallet_send(
             }
         };
 
-        // Find the exact WalletOutput matching (tx_hash, index)
         let maybe_out = outputs
             .into_iter()
             .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
@@ -2264,25 +2451,10 @@ pub extern "C" fn wallet_send(
         inputs.push(with_decoys);
     }
 
-    // Fetch fee rate
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_send: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
-
-    // Change to primary account (no explicit subaddress)
-    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
-
     // Outgoing view key seed for RNGs
     let mut ovk = [0u8; 32];
     rng.fill_bytes(&mut ovk);
 
-    // Build signable transaction
     let intent = match monero_wallet::send::SignableTransaction::new(
         monero_wallet::ringct::RctType::ClsagBulletproofPlus,
         Zeroizing::new(ovk),
@@ -2513,7 +2685,9 @@ pub extern "C" fn wallet_preview_fee(
         destinations.push((addr, p.amount));
     }
 
-    // Gather unlocked, unspent outputs until we cover total_needed (fee will be added later)
+    // Gather unlocked, unspent outputs.
+    // IMPORTANT: we must select enough inputs to cover (destinations + fee).
+    // Fee depends on input count/size, so selection is iterative until it stabilizes.
     let mut spendable = snapshot
         .tracked_outputs
         .iter()
@@ -2522,96 +2696,11 @@ pub extern "C" fn wallet_preview_fee(
         .collect::<Vec<_>>();
     spendable.sort_by_key(|o| o.amount);
 
-    let mut selected: Vec<TrackedOutput> = Vec::new();
-    let mut sum: u64 = 0;
-    for o in spendable {
-        selected.push(o.clone());
-        sum = sum.saturating_add(o.amount);
-        if sum >= total_needed {
-            break;
-        }
-    }
-    if sum < total_needed {
-        record_error(
-            -18,
-            format!(
-                "wallet_preview_fee: insufficient unlocked funds (have {}, need {})",
-                sum, total_needed
-            ),
-        );
-        return ptr::null_mut();
-    }
-
     // Build inputs with decoys
     let mut rng = OsRng;
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
-    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
-    for t in &selected {
-        let block_number = match usize::try_from(t.block_height) {
-            Ok(value) => value,
-            Err(_) => {
-                record_error(-16, "wallet_preview_fee: block number conversion overflow");
-                return ptr::null_mut();
-            }
-        };
-        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-            Ok(block) => block,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(
-                    code,
-                    format!(
-                        "wallet_preview_fee: RPC block fetch failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
-        let outputs = match scanner.scan(scannable) {
-            Ok(result) => result.ignore_additional_timelock(),
-            Err(_) => {
-                record_error(
-                    -16,
-                    format!(
-                        "wallet_preview_fee: scanner failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
-        let maybe_out = outputs
-            .into_iter()
-            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
-        let wallet_out = match maybe_out {
-            Some(wo) => wo,
-            None => {
-                record_error(
-                    -16,
-                    "wallet_preview_fee: failed to reconstruct selected output",
-                );
-                return ptr::null_mut();
-            }
-        };
-        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
-            &mut rng,
-            &rpc_client,
-            ring_len_eff,
-            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-            wallet_out,
-        )) {
-            Ok(i) => i,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(code, "wallet_preview_fee: decoy selection failed");
-                return ptr::null_mut();
-            }
-        };
-        inputs.push(with_decoys);
-    }
 
-    // Fetch fee rate
+    // Fetch fee rate once (depends on daemon policy/height, not our selection)
     let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
     {
         Ok(fr) => fr,
@@ -2623,52 +2712,205 @@ pub extern "C" fn wallet_preview_fee(
     };
 
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
-    let mut ovk = [0u8; 32];
-    rng.fill_bytes(&mut ovk);
 
-    let intent = match monero_wallet::send::SignableTransaction::new(
-        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
-        Zeroizing::new(ovk),
-        inputs,
-        destinations,
-        change,
-        Vec::new(),
-        fee_rate,
-    ) {
-        Ok(tx) => tx,
-        Err(e) => {
+    // Iteratively select inputs until we can construct a tx that covers amount + fee.
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut selected_sum: u64 = 0;
+
+    // Prevent pathological looping; input selection should converge quickly.
+    let max_selection_rounds: usize = 24;
+
+    // Track last needed value to avoid infinite loops on non-monotonic fee changes.
+    let mut last_needed_total: Option<u64> = None;
+
+    for round in 0..max_selection_rounds {
+        // Ensure we have at least enough selected for the destination totals on first pass.
+        if selected.is_empty() {
+            for o in &spendable {
+                selected.push(o.clone());
+                selected_sum = selected_sum.saturating_add(o.amount);
+                if selected_sum >= total_needed {
+                    break;
+                }
+            }
+            if selected_sum < total_needed {
+                record_error(
+                    -18,
+                    format!(
+                        "wallet_preview_fee: insufficient unlocked funds (have {}, need {})",
+                        selected_sum, total_needed
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        }
+
+        // Rebuild inputs for current selection (needed to estimate fee accurately)
+        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        for t in &selected {
+            let block_number = match usize::try_from(t.block_height) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_error(-16, "wallet_preview_fee: block number conversion overflow");
+                    return ptr::null_mut();
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_preview_fee: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    record_error(
+                        -16,
+                        format!(
+                            "wallet_preview_fee: scanner failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let maybe_out = outputs.into_iter().find(|wo| {
+                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
+            });
+            let wallet_out = match maybe_out {
+                Some(wo) => wo,
+                None => {
+                    record_error(
+                        -16,
+                        "wallet_preview_fee: failed to reconstruct selected output",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(code, "wallet_preview_fee: decoy selection failed");
+                    return ptr::null_mut();
+                }
+            };
+            inputs.push(with_decoys);
+        }
+
+        // New OVK each attempt; it should not affect fee, but keep it fresh.
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs,
+            destinations.clone(),
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                // If we fail due to not enough funds, we can try selecting more.
+                // For other construction errors, surface the error.
+                record_error(
+                    -16,
+                    format!("wallet_preview_fee: transaction construction failed ({e})"),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let fee = intent.necessary_fee();
+        let needed_total = total_needed.saturating_add(fee);
+
+        // If we already cover amount+fee, we're done: return fee.
+        if selected_sum >= needed_total {
+            let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
+                Ok(s) => s,
+                Err(err) => {
+                    record_error(
+                        -16,
+                        format!("wallet_preview_fee: result JSON serialization failed ({err})"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            match CString::new(json) {
+                Ok(cstr) => {
+                    clear_last_error();
+                    return cstr.into_raw();
+                }
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_preview_fee: result JSON contained interior null bytes",
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        }
+
+        // Guard against non-converging needed_total.
+        if let Some(last) = last_needed_total {
+            if needed_total <= last && round > 0 {
+                // We didn't make progress but still don't cover; select more.
+            }
+        }
+        last_needed_total = Some(needed_total);
+
+        // Select more inputs (one-by-one) until we cover the newly estimated required total,
+        // then loop to recompute fee with the expanded input set.
+        let mut added_any = false;
+        for o in &spendable {
+            // Skip already selected (linear scan is fine; selection sizes are small)
+            if selected
+                .iter()
+                .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+            {
+                continue;
+            }
+            selected.push(o.clone());
+            selected_sum = selected_sum.saturating_add(o.amount);
+            added_any = true;
+            if selected_sum >= needed_total {
+                break;
+            }
+        }
+
+        if !added_any {
             record_error(
-                -16,
-                format!("wallet_preview_fee: transaction construction failed ({e})"),
+                -18,
+                format!(
+                    "wallet_preview_fee: insufficient unlocked funds for amount+fee (have {}, need {})",
+                    selected_sum, needed_total
+                ),
             );
             return ptr::null_mut();
-        }
-    };
-    let fee = intent.necessary_fee();
-
-    let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
-        Ok(s) => s,
-        Err(err) => {
-            record_error(
-                -16,
-                format!("wallet_preview_fee: result JSON serialization failed ({err})"),
-            );
-            return ptr::null_mut();
-        }
-    };
-    match CString::new(json) {
-        Ok(cstr) => {
-            clear_last_error();
-            cstr.into_raw()
-        }
-        Err(_) => {
-            record_error(
-                -16,
-                "wallet_preview_fee: result JSON contained interior null bytes",
-            );
-            ptr::null_mut()
         }
     }
+
+    record_error(
+        -16,
+        "wallet_preview_fee: fee estimation did not converge (too many selection rounds)",
+    );
+    return ptr::null_mut();
 }
 
 #[no_mangle]
@@ -2860,28 +3102,182 @@ pub extern "C" fn wallet_send_with_filter(
     }
     spendable.sort_by_key(|o| o.amount);
 
-    let mut selected: Vec<TrackedOutput> = Vec::new();
-    let mut sum: u64 = 0;
-    for o in spendable {
-        selected.push(o.clone());
-        sum = sum.saturating_add(o.amount);
-        if sum >= total_needed {
-            break;
-        }
-    }
-    if sum < total_needed {
-        record_error(
-            -18,
-            format!(
-                "wallet_send_with_filter: insufficient unlocked funds (have {}, need {})",
-                sum, total_needed
-            ),
-        );
-        return ptr::null_mut();
-    }
-
+    // IMPORTANT: select enough inputs to cover (destinations + fee).
+    // Fee depends on input count, so selection is iterative until it stabilizes.
     let mut rng = OsRng;
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+
+    // Fetch fee rate once (depends on daemon policy/height, not our selection)
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(code, "wallet_send_with_filter: get_fee_rate failed");
+            return ptr::null_mut();
+        }
+    };
+
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut selected_sum: u64 = 0;
+
+    let max_selection_rounds: usize = 24;
+
+    for _round in 0..max_selection_rounds {
+        // Ensure at least enough to cover destination totals on first pass.
+        if selected.is_empty() {
+            for o in &spendable {
+                selected.push(o.clone());
+                selected_sum = selected_sum.saturating_add(o.amount);
+                if selected_sum >= total_needed {
+                    break;
+                }
+            }
+
+            if selected_sum < total_needed {
+                record_error(
+                    -18,
+                    format!(
+                        "wallet_send_with_filter: insufficient unlocked funds (have {}, need {})",
+                        selected_sum, total_needed
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        }
+
+        // Build inputs with decoys for current selection
+        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        for t in &selected {
+            let block_number = match usize::try_from(t.block_height) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_send_with_filter: block number conversion overflow",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_send_with_filter: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    record_error(
+                        -16,
+                        format!(
+                            "wallet_send_with_filter: scanner failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let maybe_out = outputs.into_iter().find(|wo| {
+                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
+            });
+            let wallet_out = match maybe_out {
+                Some(wo) => wo,
+                None => {
+                    record_error(
+                        -16,
+                        "wallet_send_with_filter: failed to reconstruct selected output",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(code, "wallet_send_with_filter: decoy selection failed");
+                    return ptr::null_mut();
+                }
+            };
+            inputs.push(with_decoys);
+        }
+
+        // New OVK each attempt; it should not affect fee, but keep it fresh.
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs,
+            destinations.clone(),
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                record_error(
+                    -16,
+                    format!("wallet_send_with_filter: transaction construction failed ({e})"),
+                );
+                return ptr::null_mut();
+            }
+        };
+        let fee_piconero = intent.necessary_fee();
+        let needed_total = total_needed.saturating_add(fee_piconero);
+
+        if selected_sum >= needed_total {
+            // Enough to cover amount + fee; proceed with signing/broadcast below.
+            break;
+        }
+
+        // Select more inputs and retry (fee may increase with more inputs).
+        let mut added_any = false;
+        for o in &spendable {
+            if selected
+                .iter()
+                .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+            {
+                continue;
+            }
+            selected.push(o.clone());
+            selected_sum = selected_sum.saturating_add(o.amount);
+            added_any = true;
+            if selected_sum >= needed_total {
+                break;
+            }
+        }
+
+        if !added_any {
+            record_error(
+                -18,
+                format!(
+                    "wallet_send_with_filter: insufficient unlocked funds for amount+fee (have {}, need {})",
+                    selected_sum, needed_total
+                ),
+            );
+            return ptr::null_mut();
+        }
+    }
+
+    // Rebuild intent one last time using final selection so `fee_piconero` below matches actual tx.
     let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
     for t in &selected {
         let block_number = match usize::try_from(t.block_height) {
@@ -2951,17 +3347,6 @@ pub extern "C" fn wallet_send_with_filter(
         inputs.push(with_decoys);
     }
 
-    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
-    {
-        Ok(fr) => fr,
-        Err(err) => {
-            let code = map_rpc_error(err);
-            record_error(code, "wallet_send_with_filter: get_fee_rate failed");
-            return ptr::null_mut();
-        }
-    };
-
-    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
     let mut ovk = [0u8; 32];
     rng.fill_bytes(&mut ovk);
 
@@ -3046,6 +3431,561 @@ pub extern "C" fn wallet_send_with_filter(
             record_error(
                 -16,
                 "wallet_send_with_filter: result JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_preview_sweep_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_preview_sweep_with_filter: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_preview_sweep_with_filter: wallet_id contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let addr_str = match unsafe { CStr::from_ptr(to_address) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_preview_sweep_with_filter: to_address contained invalid UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct InputFilter {
+        subaddress_minor: Option<u32>,
+    }
+
+    let filt_str_opt = if !filter_json.is_null() {
+        unsafe { CStr::from_ptr(filter_json) }.to_str().ok()
+    } else {
+        None
+    };
+
+    let filter: Option<InputFilter> = match filt_str_opt {
+        Some(s) if !s.trim().is_empty() => match serde_json::from_str(s) {
+            Ok(f) => Some(f),
+            Err(err) => {
+                record_error(
+                    -11,
+                    format!("wallet_preview_sweep_with_filter: invalid filter JSON ({err})"),
+                );
+                return ptr::null_mut();
+            }
+        },
+        _ => None,
+    };
+
+    let snapshot = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        match map.get(id) {
+            Some(state) => state.clone(),
+            None => {
+                record_error(
+                    -13,
+                    format!("wallet_preview_sweep_with_filter: wallet '{id}' not registered"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let arg_url = if !node_url.is_null() {
+        unsafe { CStr::from_ptr(node_url) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+    let env_url = std::env::var("MONERO_URL").ok();
+    let base_url = arg_url
+        .filter(|s| !s.is_empty())
+        .or(env_url)
+        .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
+
+    let rpc_client = match BlockingRpcTransport::new(&base_url) {
+        Ok(client) => client,
+        Err(code) => {
+            record_error(
+                code,
+                format!("wallet_preview_sweep_with_filter: invalid daemon url '{base_url}'"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let daemon = match fetch_daemon_status(&rpc_client) {
+        Ok(status) => status,
+        Err((code, message)) => {
+            record_error(
+                code,
+                format!(
+                    "wallet_preview_sweep_with_filter: failed to query daemon '{base_url}': {message}"
+                ),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let master = match master_keys_from_mnemonic_str(&snapshot.mnemonic) {
+        Ok(keys) => keys,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_preview_sweep_with_filter: unable to parse mnemonic",
+            );
+            return ptr::null_mut();
+        }
+    };
+    let view_pair = match master.to_view_pair() {
+        Ok(pair) => pair,
+        Err(code) => {
+            record_error(
+                code,
+                "wallet_preview_sweep_with_filter: failed to construct view pair",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    // Validate destination address early
+    let recipient_address = match MoneroAddress::from_str(snapshot.network, addr_str) {
+        Ok(a) => a,
+        Err(_) => {
+            record_error(
+                -10,
+                "wallet_preview_sweep_with_filter: invalid destination address",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scanner = Scanner::new(view_pair.clone());
+    let gap_limit = snapshot.gap_limit.max(1);
+    if let Some(i0) = SubaddressIndex::new(0, 0) {
+        scanner.register_subaddress(i0);
+    }
+    for minor in 1..=gap_limit {
+        if let Some(index) = SubaddressIndex::new(0, minor) {
+            scanner.register_subaddress(index);
+        }
+    }
+
+    // Spendable == unlocked & unspent only (sweep uses unlocked-only)
+    let mut spendable: Vec<TrackedOutput> = snapshot
+        .tracked_outputs
+        .iter()
+        .cloned()
+        .filter(|o| !o.spent && o.is_unlocked(daemon.height, daemon.top_block_timestamp))
+        .collect();
+
+    if let Some(f) = &filter {
+        if let Some(minor) = f.subaddress_minor {
+            spendable.retain(|o| o.subaddress_major == 0 && o.subaddress_minor == minor);
+        }
+    }
+
+    if spendable.is_empty() {
+        record_error(
+            -18,
+            "wallet_preview_sweep_with_filter: no unlocked funds to sweep",
+        );
+        return ptr::null_mut();
+    }
+
+    // Prefer fewer/larger inputs for sweeps to reduce fees.
+    spendable.sort_by_key(|o| std::cmp::Reverse(o.amount));
+
+    let mut rng = OsRng;
+    let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
+
+    // Fee rate once
+    let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
+    {
+        Ok(fr) => fr,
+        Err(err) => {
+            let code = map_rpc_error(err);
+            record_error(
+                code,
+                "wallet_preview_sweep_with_filter: get_fee_rate failed",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let change = monero_wallet::send::Change::new(view_pair.clone(), None);
+
+    // Iteratively decide how many inputs to sweep, and compute amount = sum(inputs) - fee.
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut selected_sum: u64 = 0;
+
+    let max_selection_rounds: usize = 24;
+    let mut last_amount: Option<u64> = None;
+
+    for _round in 0..max_selection_rounds {
+        // Add one more input each round until it stops increasing the computed sendable amount.
+        if selected.len() < spendable.len() {
+            let next = spendable[selected.len()].clone();
+            selected_sum = selected_sum.saturating_add(next.amount);
+            selected.push(next);
+        } else if selected.is_empty() {
+            record_error(
+                -18,
+                "wallet_preview_sweep_with_filter: no unlocked funds to sweep",
+            );
+            return ptr::null_mut();
+        }
+
+        // Build inputs with decoys
+        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        for t in &selected {
+            let block_number = match usize::try_from(t.block_height) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_preview_sweep_with_filter: block number conversion overflow",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_preview_sweep_with_filter: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    record_error(
+                        -16,
+                        format!(
+                            "wallet_preview_sweep_with_filter: scanner failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let maybe_out = outputs.into_iter().find(|wo| {
+                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
+            });
+            let wallet_out = match maybe_out {
+                Some(wo) => wo,
+                None => {
+                    record_error(
+                        -16,
+                        "wallet_preview_sweep_with_filter: failed to reconstruct selected output",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        "wallet_preview_sweep_with_filter: decoy selection failed",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            inputs.push(with_decoys);
+        }
+
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        // Start with a provisional amount; if fee changes, we'll iterate.
+        // If fee >= selected_sum, amount becomes 0 and sweep is impossible with this selection.
+        let provisional_amount = selected_sum.saturating_sub(1);
+        if provisional_amount == 0 {
+            // Not enough even before fee; try adding more inputs or fail later.
+        }
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs,
+            vec![(recipient_address, provisional_amount)],
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_preview_sweep_with_filter: transaction construction failed ({e})"
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let fee = intent.necessary_fee();
+        if fee >= selected_sum {
+            // This selection can't pay its own fee; try adding more inputs, otherwise fail.
+            if selected.len() >= spendable.len() {
+                record_error(
+                    -18,
+                    format!(
+                        "wallet_preview_sweep_with_filter: insufficient unlocked funds to pay fee (inputs {}, necessary_fee {})",
+                        selected_sum, fee
+                    ),
+                );
+                return ptr::null_mut();
+            }
+            continue;
+        }
+
+        let amount = selected_sum.saturating_sub(fee);
+
+        // Stop when amount stops improving (adding more inputs would mostly increase fee).
+        if let Some(prev) = last_amount {
+            if amount <= prev {
+                // Use previous best result
+                let json = match serde_json::to_string(
+                    &serde_json::json!({ "amount": prev, "fee": selected_sum.saturating_sub(prev) }),
+                ) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        record_error(
+                            -16,
+                            format!("wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                match CString::new(json) {
+                    Ok(cstr) => {
+                        clear_last_error();
+                        return cstr.into_raw();
+                    }
+                    Err(_) => {
+                        record_error(
+                            -16,
+                            "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
+                        );
+                        return ptr::null_mut();
+                    }
+                }
+            }
+        }
+
+        last_amount = Some(amount);
+
+        // If we've already swept all unlocked outputs, return best.
+        if selected.len() >= spendable.len() {
+            let json = match serde_json::to_string(
+                &serde_json::json!({ "amount": amount, "fee": fee }),
+            ) {
+                Ok(s) => s,
+                Err(err) => {
+                    record_error(
+                        -16,
+                        format!("wallet_preview_sweep_with_filter: result JSON serialization failed ({err})"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            match CString::new(json) {
+                Ok(cstr) => {
+                    clear_last_error();
+                    return cstr.into_raw();
+                }
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_preview_sweep_with_filter: result JSON contained interior null bytes",
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        }
+    }
+
+    record_error(
+        -16,
+        "wallet_preview_sweep_with_filter: fee estimation did not converge (too many selection rounds)",
+    );
+    ptr::null_mut()
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_sweep_with_filter(
+    wallet_id: *const c_char,
+    node_url: *const c_char,
+    to_address: *const c_char,
+    filter_json: *const c_char,
+    ring_len: u8,
+) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() || to_address.is_null() {
+        record_error(-11, "wallet_sweep_with_filter: null argument(s)");
+        return ptr::null_mut();
+    }
+
+    // First, preview to get computed amount+fee (unlocked-only).
+    let preview_ptr =
+        wallet_preview_sweep_with_filter(wallet_id, node_url, to_address, filter_json, ring_len);
+    if preview_ptr.is_null() {
+        // wallet_preview_sweep_with_filter already recorded last_error
+        return ptr::null_mut();
+    }
+    let preview_str = unsafe { CStr::from_ptr(preview_ptr) }
+        .to_string_lossy()
+        .to_string();
+    let _ = walletcore_free_cstr(preview_ptr);
+
+    #[derive(Deserialize)]
+    struct SweepPreviewResult {
+        amount: u64,
+    }
+
+    let preview: SweepPreviewResult = match serde_json::from_str(&preview_str) {
+        Ok(v) => v,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: failed to decode preview result ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    if preview.amount == 0 {
+        record_error(
+            -18,
+            "wallet_sweep_with_filter: computed sweep amount is zero",
+        );
+        return ptr::null_mut();
+    }
+
+    // Use existing send_with_filter by constructing destinations JSON.
+    let dest_json = match serde_json::to_string(&vec![serde_json::json!({
+        "address": unsafe { CStr::from_ptr(to_address) }.to_string_lossy().to_string(),
+        "amount": preview.amount
+    })]) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: destinations JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let send_ptr = CString::new(dest_json).ok();
+    let send_cstr = match send_ptr {
+        Some(c) => c,
+        None => {
+            record_error(
+                -16,
+                "wallet_sweep_with_filter: destinations JSON contained interior null bytes",
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let raw = wallet_send_with_filter(
+        wallet_id,
+        node_url,
+        send_cstr.as_ptr(),
+        filter_json,
+        ring_len,
+    );
+    if raw.is_null() {
+        return ptr::null_mut();
+    }
+
+    let send_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().to_string();
+    let _ = walletcore_free_cstr(raw);
+
+    #[derive(Deserialize)]
+    struct SendResult {
+        txid: String,
+        fee: u64,
+    }
+    let send_res: SendResult = match serde_json::from_str(&send_str) {
+        Ok(v) => v,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: failed to decode send result ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    // Note: `fee` is used below; keep it as part of the decoded struct to avoid relying on string parsing.
+
+    let result_json = match serde_json::to_string(&serde_json::json!({
+        "txid": send_res.txid,
+        "amount": preview.amount,
+        "fee": send_res.fee
+    })) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_sweep_with_filter: result JSON serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    match CString::new(result_json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_sweep_with_filter: result JSON contained interior null bytes",
             );
             ptr::null_mut()
         }
@@ -3249,103 +4189,12 @@ pub extern "C" fn wallet_preview_fee_with_filter(
     }
     spendable.sort_by_key(|o| o.amount);
 
-    // Select enough to cover destination totals
-    let mut selected: Vec<TrackedOutput> = Vec::new();
-    let mut sum: u64 = 0;
-    for o in spendable {
-        selected.push(o.clone());
-        sum = sum.saturating_add(o.amount);
-        if sum >= total_needed {
-            break;
-        }
-    }
-    if sum < total_needed {
-        record_error(
-            -18,
-            format!(
-                "wallet_preview_fee_with_filter: insufficient unlocked funds (have {}, need {})",
-                sum, total_needed
-            ),
-        );
-        return ptr::null_mut();
-    }
-
-    // Build decoy-selected inputs
+    // IMPORTANT: select enough inputs to cover (destinations + fee).
+    // Fee depends on input count/size, so selection is iterative until it stabilizes.
     let mut rng = OsRng;
     let ring_len_eff: u8 = if ring_len < 2 { 16 } else { ring_len };
-    let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
-    for t in &selected {
-        let block_number = match usize::try_from(t.block_height) {
-            Ok(value) => value,
-            Err(_) => {
-                record_error(
-                    -16,
-                    "wallet_preview_fee_with_filter: block number conversion overflow",
-                );
-                return ptr::null_mut();
-            }
-        };
-        let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
-            Ok(block) => block,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(
-                    code,
-                    format!(
-                        "wallet_preview_fee_with_filter: RPC block fetch failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
-        let outputs = match scanner.scan(scannable) {
-            Ok(result) => result.ignore_additional_timelock(),
-            Err(_) => {
-                record_error(
-                    -16,
-                    format!(
-                        "wallet_preview_fee_with_filter: scanner failed at height {}",
-                        t.block_height
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
-        let maybe_out = outputs
-            .into_iter()
-            .find(|wo| wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx);
-        let wallet_out = match maybe_out {
-            Some(wo) => wo,
-            None => {
-                record_error(
-                    -16,
-                    "wallet_preview_fee_with_filter: failed to reconstruct selected output",
-                );
-                return ptr::null_mut();
-            }
-        };
-        let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
-            &mut rng,
-            &rpc_client,
-            ring_len_eff,
-            usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
-            wallet_out,
-        )) {
-            Ok(i) => i,
-            Err(err) => {
-                let code = map_rpc_error(err);
-                record_error(
-                    code,
-                    "wallet_preview_fee_with_filter: decoy selection failed",
-                );
-                return ptr::null_mut();
-            }
-        };
-        inputs.push(with_decoys);
-    }
 
-    // Fetch fee rate
+    // Fetch fee rate once (depends on daemon policy/height, not our selection)
     let fee_rate = match block_on(rpc_client.get_fee_rate(monero_wallet::rpc::FeePriority::Normal))
     {
         Ok(fr) => fr,
@@ -3356,52 +4205,198 @@ pub extern "C" fn wallet_preview_fee_with_filter(
         }
     };
 
-    // Build intent and compute fee
     let change = monero_wallet::send::Change::new(view_pair.clone(), None);
-    let mut ovk = [0u8; 32];
-    rng.fill_bytes(&mut ovk);
 
-    let intent = match monero_wallet::send::SignableTransaction::new(
-        monero_wallet::ringct::RctType::ClsagBulletproofPlus,
-        Zeroizing::new(ovk),
-        inputs,
-        destinations,
-        change,
-        Vec::new(),
-        fee_rate,
-    ) {
-        Ok(tx) => tx,
-        Err(e) => {
+    // Iteratively select inputs until we can construct a tx that covers amount + fee.
+    let mut selected: Vec<TrackedOutput> = Vec::new();
+    let mut selected_sum: u64 = 0;
+
+    // Prevent pathological looping; input selection should converge quickly.
+    let max_selection_rounds: usize = 24;
+
+    for _round in 0..max_selection_rounds {
+        // Ensure we have at least enough selected for the destination totals on first pass.
+        if selected.is_empty() {
+            for o in &spendable {
+                selected.push(o.clone());
+                selected_sum = selected_sum.saturating_add(o.amount);
+                if selected_sum >= total_needed {
+                    break;
+                }
+            }
+            if selected_sum < total_needed {
+                record_error(
+                    -18,
+                    format!(
+                        "wallet_preview_fee_with_filter: insufficient unlocked funds (have {}, need {})",
+                        selected_sum, total_needed
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        }
+
+        // Build decoy-selected inputs for the current selection (needed to estimate fee accurately)
+        let mut inputs: Vec<monero_wallet::OutputWithDecoys> = Vec::new();
+        for t in &selected {
+            let block_number = match usize::try_from(t.block_height) {
+                Ok(value) => value,
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_preview_fee_with_filter: block number conversion overflow",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let scannable = match block_on(rpc_client.get_scannable_block_by_number(block_number)) {
+                Ok(block) => block,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        format!(
+                            "wallet_preview_fee_with_filter: RPC block fetch failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let outputs = match scanner.scan(scannable) {
+                Ok(result) => result.ignore_additional_timelock(),
+                Err(_) => {
+                    record_error(
+                        -16,
+                        format!(
+                            "wallet_preview_fee_with_filter: scanner failed at height {}",
+                            t.block_height
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let maybe_out = outputs.into_iter().find(|wo| {
+                wo.transaction() == t.tx_hash && wo.index_in_transaction() == t.index_in_tx
+            });
+            let wallet_out = match maybe_out {
+                Some(wo) => wo,
+                None => {
+                    record_error(
+                        -16,
+                        "wallet_preview_fee_with_filter: failed to reconstruct selected output",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let with_decoys = match block_on(monero_wallet::OutputWithDecoys::new(
+                &mut rng,
+                &rpc_client,
+                ring_len_eff,
+                usize::try_from(daemon.height).unwrap_or(daemon.height as usize),
+                wallet_out,
+            )) {
+                Ok(i) => i,
+                Err(err) => {
+                    let code = map_rpc_error(err);
+                    record_error(
+                        code,
+                        "wallet_preview_fee_with_filter: decoy selection failed",
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            inputs.push(with_decoys);
+        }
+
+        // New OVK each attempt; it should not affect fee, but keep it fresh.
+        let mut ovk = [0u8; 32];
+        rng.fill_bytes(&mut ovk);
+
+        let intent = match monero_wallet::send::SignableTransaction::new(
+            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+            Zeroizing::new(ovk),
+            inputs,
+            destinations.clone(),
+            change.clone(),
+            Vec::new(),
+            fee_rate,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => {
+                record_error(
+                    -16,
+                    format!(
+                        "wallet_preview_fee_with_filter: transaction construction failed ({e})"
+                    ),
+                );
+                return ptr::null_mut();
+            }
+        };
+
+        let fee = intent.necessary_fee();
+        let needed_total = total_needed.saturating_add(fee);
+
+        // If we already cover amount+fee, we're done: return fee.
+        if selected_sum >= needed_total {
+            let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
+                Ok(s) => s,
+                Err(err) => {
+                    record_error(
+                        -16,
+                        format!("wallet_preview_fee_with_filter: result JSON serialization failed ({err})"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            match CString::new(json) {
+                Ok(cstr) => {
+                    clear_last_error();
+                    return cstr.into_raw();
+                }
+                Err(_) => {
+                    record_error(
+                        -16,
+                        "wallet_preview_fee_with_filter: result JSON contained interior null bytes",
+                    );
+                    return ptr::null_mut();
+                }
+            }
+        }
+
+        // Otherwise, select more inputs and retry (fee may increase with more inputs).
+        let mut added_any = false;
+        for o in &spendable {
+            // Skip already selected
+            if selected
+                .iter()
+                .any(|s| s.tx_hash == o.tx_hash && s.index_in_tx == o.index_in_tx)
+            {
+                continue;
+            }
+            selected.push(o.clone());
+            selected_sum = selected_sum.saturating_add(o.amount);
+            added_any = true;
+            if selected_sum >= needed_total {
+                break;
+            }
+        }
+
+        if !added_any {
             record_error(
-                -16,
-                format!("wallet_preview_fee_with_filter: transaction construction failed ({e})"),
+                -18,
+                format!(
+                    "wallet_preview_fee_with_filter: insufficient unlocked funds for amount+fee (have {}, need {})",
+                    selected_sum, needed_total
+                ),
             );
             return ptr::null_mut();
-        }
-    };
-    let fee = intent.necessary_fee();
-
-    let json = match serde_json::to_string(&serde_json::json!({ "fee": fee })) {
-        Ok(s) => s,
-        Err(err) => {
-            record_error(
-                -16,
-                format!("wallet_preview_fee_with_filter: result JSON serialization failed ({err})"),
-            );
-            return ptr::null_mut();
-        }
-    };
-    match CString::new(json) {
-        Ok(cstr) => {
-            clear_last_error();
-            cstr.into_raw()
-        }
-        Err(_) => {
-            record_error(
-                -16,
-                "wallet_preview_fee_with_filter: result JSON contained interior null bytes",
-            );
-            ptr::null_mut()
         }
     }
+
+    record_error(
+        -16,
+        "wallet_preview_fee_with_filter: fee estimation did not converge (too many selection rounds)",
+    );
+    return ptr::null_mut();
 }

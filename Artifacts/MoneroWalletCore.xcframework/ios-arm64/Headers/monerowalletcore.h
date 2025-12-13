@@ -191,6 +191,69 @@ char* wallet_export_outputs_json(
 /* ===== Transfers: preview/send ===== */
 
 /*
+ * Preview fee and max-sendable amount for a sweep ("send all") to a single destination.
+ * Semantics:
+ *   - The recipient amount is computed by the core (roughly unlocked - fee).
+ *   - Returns JSON:
+ *       { "amount": <uint64>, "fee": <uint64> }
+ *     where `amount` is the amount to send to the recipient in piconero.
+ * Notes:
+ *   - If unlocked funds are insufficient to pay the fee, returns an error.
+ *   - This is designed for "Send Max" UX.
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_preview_sweep(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    uint8_t ring_len
+);
+
+/*
+ * Sweep ("send all") to a single destination.
+ * Semantics:
+ *   - The recipient amount is computed by the core (roughly unlocked - fee).
+ *   - Returns JSON:
+ *       { "txid": "<hex>", "amount": <uint64>, "fee": <uint64> }
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_sweep(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    uint8_t ring_len
+);
+
+/*
+ * Preview fee and max-sendable amount for a sweep ("send all") with an optional input filter.
+ * filter_json is a JSON object (or NULL). Useful for sweeping a specific subaddress.
+ * Returns JSON:
+ *   { "amount": <uint64>, "fee": <uint64> }
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_preview_sweep_with_filter(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    const char* filter_json,
+    uint8_t ring_len
+);
+
+/*
+ * Sweep ("send all") with an optional input filter (e.g., constrain to a subaddress).
+ * Returns JSON:
+ *   { "txid": "<hex>", "amount": <uint64>, "fee": <uint64> }
+ * Caller must free the returned string with walletcore_free_cstr.
+ */
+char* wallet_sweep_with_filter(
+    const char* wallet_id,
+    const char* node_url,
+    const char* to_address,
+    const char* filter_json,
+    uint8_t ring_len
+);
+
+/*
  * Send to a single destination. Returns JSON:
  *   { "txid": "<hex>", "fee": <uint64> }
  * Caller must free the returned string with walletcore_free_cstr.

@@ -98,6 +98,21 @@ public enum WalletCoreFFIClient {
         public let fee: UInt64
     }
 
+    /// Sweep preview result schema returned by FFI JSON calls.
+    /// JSON: { "amount": <uint64>, "fee": <uint64> }
+    public struct SweepPreviewResult: Decodable {
+        public let amount: UInt64
+        public let fee: UInt64
+    }
+
+    /// Sweep send result schema returned by FFI JSON calls.
+    /// JSON: { "txid": "<hex>", "amount": <uint64>, "fee": <uint64> }
+    public struct SweepSendResult: Decodable {
+        public let txid: String
+        public let amount: UInt64
+        public let fee: UInt64
+    }
+
     public struct SyncStatus: Equatable {
         public let chainHeight: UInt64
         public let chainTime: UInt64
@@ -365,6 +380,166 @@ public enum WalletCoreFFIClient {
             return fee
         }
         throw WalletCoreFFIError.decode("Unexpected preview_fee_with_filter payload: \(s)")
+    }
+
+    // MARK: - Sweep ("Send Max")
+
+    /// Preview sweep ("Send Max") for a single destination.
+    /// - Returns: (amount, fee) in piconero where `amount` is the computed sendable amount (roughly unlocked - fee).
+    public static func previewSweep(
+        walletId: String,
+        toAddress: String,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> (amount: UInt64, fee: UInt64) {
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        wallet_preview_sweep(cId, cNode, cAddr, ringLen)
+                    }
+                }
+            } else {
+                return toAddress.withCString { cAddr in
+                    wallet_preview_sweep(cId, nil, cAddr, ringLen)
+                }
+            }
+        }
+
+        let s = try takeCString(raw, context: "wallet_preview_sweep")
+        guard let data = s.data(using: .utf8),
+              let res = try? jsonDecoder.decode(SweepPreviewResult.self, from: data) else {
+            throw WalletCoreFFIError.decode("Unexpected preview_sweep payload: \(s)")
+        }
+        return (amount: res.amount, fee: res.fee)
+    }
+
+    /// Preview sweep ("Send Max") constrained by an input filter (e.g., subaddress minor).
+    /// `filter` is passed as JSON object (e.g., {"subaddress_minor": 12}).
+    public static func previewSweepWithFilter(
+        walletId: String,
+        toAddress: String,
+        filter: [String: Any]? = nil,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> (amount: UInt64, fee: UInt64) {
+        let filterJSON: String? = {
+            guard let filter else { return nil }
+            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
+            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
+            return data.flatMap { String(data: $0, encoding: .utf8) }
+        }()
+
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        if let f = filterJSON {
+                            return f.withCString { cFilter in
+                                wallet_preview_sweep_with_filter(cId, cNode, cAddr, cFilter, ringLen)
+                            }
+                        } else {
+                            return wallet_preview_sweep_with_filter(cId, cNode, cAddr, nil, ringLen)
+                        }
+                    }
+                }
+            } else {
+                return toAddress.withCString { cAddr in
+                    if let f = filterJSON {
+                        return f.withCString { cFilter in
+                            wallet_preview_sweep_with_filter(cId, nil, cAddr, cFilter, ringLen)
+                        }
+                    } else {
+                        return wallet_preview_sweep_with_filter(cId, nil, cAddr, nil, ringLen)
+                    }
+                }
+            }
+        }
+
+        let s = try takeCString(raw, context: "wallet_preview_sweep_with_filter")
+        guard let data = s.data(using: .utf8),
+              let res = try? jsonDecoder.decode(SweepPreviewResult.self, from: data) else {
+            throw WalletCoreFFIError.decode("Unexpected preview_sweep_with_filter payload: \(s)")
+        }
+        return (amount: res.amount, fee: res.fee)
+    }
+
+    /// Sweep ("Send Max") to a single destination. Returns (txid, amount, fee).
+    public static func sweep(
+        walletId: String,
+        toAddress: String,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> (txid: String, amount: UInt64, fee: UInt64) {
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        wallet_sweep(cId, cNode, cAddr, ringLen)
+                    }
+                }
+            } else {
+                return toAddress.withCString { cAddr in
+                    wallet_sweep(cId, nil, cAddr, ringLen)
+                }
+            }
+        }
+
+        let s = try takeCString(raw, context: "wallet_sweep")
+        guard let data = s.data(using: .utf8),
+              let res = try? jsonDecoder.decode(SweepSendResult.self, from: data) else {
+            throw WalletCoreFFIError.decode("Unexpected sweep payload: \(s)")
+        }
+        return (txid: res.txid, amount: res.amount, fee: res.fee)
+    }
+
+    /// Sweep ("Send Max") constrained by an input filter (e.g., subaddress minor). Returns (txid, amount, fee).
+    public static func sweepWithFilter(
+        walletId: String,
+        toAddress: String,
+        filter: [String: Any]? = nil,
+        ringLen: UInt8 = 16,
+        nodeURL: String? = nil
+    ) throws -> (txid: String, amount: UInt64, fee: UInt64) {
+        let filterJSON: String? = {
+            guard let filter else { return nil }
+            guard JSONSerialization.isValidJSONObject(filter) else { return nil }
+            let data = try? JSONSerialization.data(withJSONObject: filter, options: [])
+            return data.flatMap { String(data: $0, encoding: .utf8) }
+        }()
+
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            if let node = nodeURL {
+                return node.withCString { cNode in
+                    toAddress.withCString { cAddr in
+                        if let f = filterJSON {
+                            return f.withCString { cFilter in
+                                wallet_sweep_with_filter(cId, cNode, cAddr, cFilter, ringLen)
+                            }
+                        } else {
+                            return wallet_sweep_with_filter(cId, cNode, cAddr, nil, ringLen)
+                        }
+                    }
+                }
+            } else {
+                return toAddress.withCString { cAddr in
+                    if let f = filterJSON {
+                        return f.withCString { cFilter in
+                            wallet_sweep_with_filter(cId, nil, cAddr, cFilter, ringLen)
+                        }
+                    } else {
+                        return wallet_sweep_with_filter(cId, nil, cAddr, nil, ringLen)
+                    }
+                }
+            }
+        }
+
+        let s = try takeCString(raw, context: "wallet_sweep_with_filter")
+        guard let data = s.data(using: .utf8),
+              let res = try? jsonDecoder.decode(SweepSendResult.self, from: data) else {
+            throw WalletCoreFFIError.decode("Unexpected sweep_with_filter payload: \(s)")
+        }
+        return (txid: res.txid, amount: res.amount, fee: res.fee)
     }
 
     /// Send a single-destination transfer. Returns (txid, fee).
