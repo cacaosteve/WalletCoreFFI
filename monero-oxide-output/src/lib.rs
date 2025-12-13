@@ -3732,39 +3732,59 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
             inputs.push(with_decoys);
         }
 
-        let mut ovk = [0u8; 32];
-        rng.fill_bytes(&mut ovk);
+        // Compute a consistent sweep amount via fixed-point iteration:
+        // amount = selected_sum - fee(amount), because fee depends on tx weight which depends on amount encoding.
+        // This prevents constructing impossible txs where outputs ~= inputs with no room for fee.
+        let mut amount_guess: u64 = selected_sum;
+        let mut fee: u64 = 0;
 
-        // Start with a provisional amount; if fee changes, we'll iterate.
-        // If fee >= selected_sum, amount becomes 0 and sweep is impossible with this selection.
-        let provisional_amount = selected_sum.saturating_sub(1);
-        if provisional_amount == 0 {
-            // Not enough even before fee; try adding more inputs or fail later.
+        // Small bound; this should converge quickly because fee changes are small and monotonic-ish with size.
+        let max_amount_iters: usize = 12;
+
+        for _ in 0..max_amount_iters {
+            let mut ovk = [0u8; 32];
+            rng.fill_bytes(&mut ovk);
+
+            // If fee >= selected_sum, sweep is impossible with this selection.
+            // Clamp to zero to force failure handling below.
+            let candidate_amount = selected_sum.saturating_sub(fee);
+
+            let intent = match monero_wallet::send::SignableTransaction::new(
+                monero_wallet::ringct::RctType::ClsagBulletproofPlus,
+                Zeroizing::new(ovk),
+                inputs.clone(),
+                vec![(recipient_address, candidate_amount)],
+                change.clone(),
+                Vec::new(),
+                fee_rate,
+            ) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    record_error(
+                        -16,
+                        format!(
+                            "wallet_preview_sweep_with_filter: transaction construction failed ({e})"
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+
+            let new_fee = intent.necessary_fee();
+            let new_amount = selected_sum.saturating_sub(new_fee);
+
+            // Converged: amount consistent with fee
+            if new_amount == amount_guess && new_fee == fee {
+                fee = new_fee;
+                amount_guess = new_amount;
+                break;
+            }
+
+            fee = new_fee;
+            amount_guess = new_amount;
         }
 
-        let intent = match monero_wallet::send::SignableTransaction::new(
-            monero_wallet::ringct::RctType::ClsagBulletproofPlus,
-            Zeroizing::new(ovk),
-            inputs,
-            vec![(recipient_address, provisional_amount)],
-            change.clone(),
-            Vec::new(),
-            fee_rate,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                record_error(
-                    -16,
-                    format!(
-                        "wallet_preview_sweep_with_filter: transaction construction failed ({e})"
-                    ),
-                );
-                return ptr::null_mut();
-            }
-        };
-
-        let fee = intent.necessary_fee();
-        if fee >= selected_sum {
+        if fee >= selected_sum || amount_guess == 0 {
             // This selection can't pay its own fee; try adding more inputs, otherwise fail.
             if selected.len() >= spendable.len() {
                 record_error(
@@ -3779,7 +3799,7 @@ pub extern "C" fn wallet_preview_sweep_with_filter(
             continue;
         }
 
-        let amount = selected_sum.saturating_sub(fee);
+        let amount = amount_guess;
 
         // Stop when amount stops improving (adding more inputs would mostly increase fee).
         if let Some(prev) = last_amount {
