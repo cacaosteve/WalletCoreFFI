@@ -98,6 +98,34 @@ public enum WalletCoreFFIClient {
         public let fee: UInt64
     }
 
+    /// Transfer history row schema returned by FFI JSON calls.
+    /// JSON: { "txid": "<hex>", "direction": "in"|"out"|"self", "amount": <uint64>, "fee": <uint64|null>, ... }
+    public struct Transfer: Decodable, Equatable {
+        public let txid: String
+        public let direction: String
+        public let amount: UInt64
+        public let fee: UInt64?
+        public let height: UInt64?
+        public let timestamp: UInt64?
+        public let confirmations: UInt64
+        public let isPending: Bool
+        public let subaddressMajor: UInt32?
+        public let subaddressMinor: UInt32?
+
+        private enum CodingKeys: String, CodingKey {
+            case txid
+            case direction
+            case amount
+            case fee
+            case height
+            case timestamp
+            case confirmations
+            case isPending = "is_pending"
+            case subaddressMajor = "subaddress_major"
+            case subaddressMinor = "subaddress_minor"
+        }
+    }
+
     /// Sweep preview result schema returned by FFI JSON calls.
     /// JSON: { "amount": <uint64>, "fee": <uint64> }
     public struct SweepPreviewResult: Decodable {
@@ -697,6 +725,29 @@ public enum WalletCoreFFIClient {
             return try jsonDecoder.decode(WalletObservedOutputsEnvelope.self, from: data)
         } catch {
             throw WalletCoreFFIError.decode("Failed to decode observed outputs: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Transfers history (JSON) and typed decode
+
+    /// Export transfer history for a wallet as a JSON string (owned by Swift).
+    public static func exportTransfersJSON(walletId: String) throws -> String {
+        let raw: UnsafeMutablePointer<CChar>? = walletId.withCString { cId in
+            wallet_list_transfers_json(cId)
+        }
+        return try takeCString(raw, context: "wallet_list_transfers_json")
+    }
+
+    /// Convenience: Export and decode transfer history into typed rows.
+    public static func listTransfers(walletId: String) throws -> [Transfer] {
+        let json = try exportTransfersJSON(walletId: walletId)
+        guard let data = json.data(using: .utf8) else {
+            throw WalletCoreFFIError.decode("wallet_list_transfers_json returned non-UTF8")
+        }
+        do {
+            return try jsonDecoder.decode([Transfer].self, from: data)
+        } catch {
+            throw WalletCoreFFIError.decode("Failed to decode transfers: \(error.localizedDescription)")
         }
     }
 

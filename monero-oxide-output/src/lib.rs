@@ -29,6 +29,7 @@ use monero_wallet::{
     transaction::Timelock,
     Scanner, ViewPair,
 };
+
 use serde::{Deserialize, Serialize};
 // Keccak256 is used via EdScalar::hash(), no direct import needed
 use once_cell::sync::Lazy;
@@ -711,6 +712,16 @@ struct TrackedOutput {
     spent: bool,
 }
 
+/// Minimal pending-outgoing record for UI history.
+/// We add this when a send/sweep successfully broadcasts, and clear it once it is confirmed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingOutgoingTx {
+    txid: String,
+    amount: u64,
+    fee: u64,
+    created_at: u64,
+}
+
 impl TrackedOutput {
     fn is_unlocked(&self, chain_height: u64, chain_time: u64) -> bool {
         let base_lock = if self.is_coinbase {
@@ -767,6 +778,52 @@ struct ObservedOutputsEnvelope {
     chain_height: u64,
     chain_time: u64,
     outputs: Vec<ObservedOutput>,
+}
+
+/// Transaction-level transfer row for UI history.
+///
+/// NOTE: This is the API-facing JSON row we return to Swift.
+/// Internal, stable history is maintained in `LedgerEntry`.
+#[derive(Clone, Debug, Serialize)]
+struct ObservedTransfer {
+    txid: String,
+    direction: String, // "in" | "out" | "self"
+    amount: u64,       // piconero (positive; interpret via direction)
+    fee: Option<u64>,  // piconero (outgoing)
+    height: Option<u64>,
+    timestamp: Option<u64>,
+    confirmations: u64,
+    is_pending: bool,
+    // MVP choice (A): we do not attribute transfers to a specific subaddress because a tx can touch multiple.
+    subaddress_major: Option<u32>,
+    subaddress_minor: Option<u32>,
+}
+
+/// Persisted ledger entry used to build stable transfer history.
+///
+/// - Incoming ("in"): `amount` is the total received in that tx to this wallet (sum of outputs).
+/// - Outgoing ("out"): `amount` is the recipient amount (what the user intended to send), fee stored separately.
+/// - Coinbase receives are included (as "in") with `is_coinbase = true`.
+///
+/// We keep this separate from `TrackedOutput` so history remains stable even after outputs are spent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LedgerEntry {
+    txid: String,
+    direction: String, // "in" | "out" | "self"
+    amount: u64,       // piconero (positive; interpret via direction)
+    fee: Option<u64>,  // piconero (outgoing)
+    height: Option<u64>,
+    timestamp: Option<u64>,
+    is_pending: bool,
+    is_coinbase: bool,
+}
+
+fn confirmations_for_height(chain_height: u64, tx_height: u64) -> u64 {
+    if tx_height == 0 {
+        0
+    } else {
+        chain_height.saturating_sub(tx_height).saturating_add(1)
+    }
 }
 
 fn hex_lowercase(bytes: &[u8]) -> String {
@@ -854,6 +911,8 @@ struct StoredWallet {
     gap_limit: u32,
     tracked_outputs: Vec<TrackedOutput>,
     seen_outpoints: HashSet<([u8; 32], u64)>,
+    pending_outgoing: Vec<PendingOutgoingTx>,
+    tx_ledger: HashMap<String, LedgerEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -894,6 +953,8 @@ struct PersistedWallet {
     gap_limit: u32,
     tracked_outputs: Vec<PersistedOutput>,
     seen_outpoints: Vec<([u8; 32], u64)>,
+    pending_outgoing: Vec<PendingOutgoingTx>,
+    tx_ledger: HashMap<String, LedgerEntry>,
 }
 
 impl From<&Timelock> for PersistedTimelock {
@@ -985,7 +1046,9 @@ impl From<&StoredWallet> for PersistedWallet {
                 .iter()
                 .map(PersistedOutput::from)
                 .collect(),
-            seen_outpoints: wallet.seen_outpoints.iter().cloned().collect(),
+            seen_outpoints: wallet.seen_outpoints.iter().copied().collect(),
+            pending_outgoing: wallet.pending_outgoing.clone(),
+            tx_ledger: wallet.tx_ledger.clone(),
         }
     }
 }
@@ -1004,6 +1067,14 @@ impl PersistedWallet {
             .map(TrackedOutput::from)
             .collect();
         state.seen_outpoints = self.seen_outpoints.into_iter().collect();
+        state.pending_outgoing = self.pending_outgoing;
+        state.tx_ledger = self.tx_ledger;
+
+        // Defensive: older caches or older runtime state may not have initialized the ledger.
+        // Ensure it exists so transfer history can be built deterministically.
+        if state.tx_ledger.is_empty() {
+            state.tx_ledger = HashMap::new();
+        }
     }
 }
 
@@ -1168,6 +1239,8 @@ pub extern "C" fn wallet_open_from_mnemonic(
                 gap_limit: 50,
                 tracked_outputs: Vec::new(),
                 seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
+                pending_outgoing: Vec::new(),
+                tx_ledger: HashMap::new(),
             });
         }
     }
@@ -1628,6 +1701,219 @@ pub extern "C" fn wallet_refresh(
             );
         }
     }
+
+    // Update stable transfer ledger based on observed outputs.
+    //
+    // - We keep history stable even after outputs are spent by persisting an aggregate per txid.
+    // - Incoming ("in"): sum all outputs seen for that txid (including coinbase).
+    // - Confirm pending outgoing ("out"):
+    //   1) heuristic: if we ever see an on-chain output with that txid (typically change), mark confirmed
+    //   2) fallback: query the daemon for tx existence by hash via json_rpc_call("get_transactions")
+    let mut computed_ledger: HashMap<String, LedgerEntry> = snapshot.tx_ledger.clone();
+    for o in &working_outputs {
+        let txid = hex_lowercase(&o.tx_hash);
+
+        // If this txid exists as pending outgoing, seeing it on-chain is enough to confirm it (common case: change).
+        if let Some(entry) = computed_ledger.get_mut(&txid) {
+            if entry.direction == "out" && entry.is_pending {
+                entry.is_pending = false;
+                if entry.height.is_none() || entry.height == Some(0) {
+                    entry.height = if o.block_height == 0 {
+                        None
+                    } else {
+                        Some(o.block_height)
+                    };
+                }
+                if entry.timestamp.is_none() && daemon.top_block_timestamp > 0 {
+                    entry.timestamp = Some(daemon.top_block_timestamp);
+                }
+            }
+        }
+
+        // Aggregate incoming amounts (coinbase included) irrespective of spent status.
+        // If an outgoing record exists, we do NOT overwrite direction; we only allow "in" creation for unknown txids.
+        match computed_ledger.get_mut(&txid) {
+            Some(entry) => {
+                if entry.direction == "in" {
+                    entry.amount = entry.amount.saturating_add(o.amount);
+                    entry.is_coinbase = entry.is_coinbase || o.is_coinbase;
+                    if entry.height.is_none() || entry.height == Some(0) {
+                        entry.height = if o.block_height == 0 {
+                            None
+                        } else {
+                            Some(o.block_height)
+                        };
+                    } else if let Some(h) = entry.height {
+                        if o.block_height != 0 && o.block_height < h {
+                            entry.height = Some(o.block_height);
+                        }
+                    }
+                    if entry.timestamp.is_none() && daemon.top_block_timestamp > 0 {
+                        entry.timestamp = Some(daemon.top_block_timestamp);
+                    }
+                }
+            }
+            None => {
+                computed_ledger.insert(
+                    txid.clone(),
+                    LedgerEntry {
+                        txid,
+                        direction: "in".to_string(),
+                        amount: o.amount,
+                        fee: None,
+                        height: if o.block_height == 0 {
+                            None
+                        } else {
+                            Some(o.block_height)
+                        },
+                        timestamp: if daemon.top_block_timestamp > 0 {
+                            Some(daemon.top_block_timestamp)
+                        } else {
+                            None
+                        },
+                        is_pending: false,
+                        is_coinbase: o.is_coinbase,
+                    },
+                );
+            }
+        }
+    }
+
+    // Fallback confirmation: ask the daemon whether remaining pending outgoing txids exist.
+    // This is bounded by the number of pending outgoing entries (typically small).
+    {
+        // Collect pending txids still marked pending in the ledger.
+        let mut txs_hashes: Vec<String> = Vec::new();
+        for p in snapshot.pending_outgoing.iter() {
+            if let Some(entry) = computed_ledger.get(&p.txid) {
+                if entry.direction == "out" && entry.is_pending {
+                    txs_hashes.push(p.txid.clone());
+                }
+            }
+        }
+
+        if !txs_hashes.is_empty() {
+            // Call daemon get_transactions and parse enough fields to distinguish:
+            // - in_pool == true  => still pending
+            // - in_pool == false => mined (set height if available)
+            //
+            // This avoids incorrectly marking mempool txs as confirmed.
+            match rpc_client.json_rpc_call(
+                "get_transactions",
+                serde_json::json!({ "txs_hashes": txs_hashes }),
+            ) {
+                Ok(value) => {
+                    if let Some(result) = value.get("result") {
+                        // missed_tx is returned as an array of hex strings for unknown txs
+                        let missed: std::collections::HashSet<String> = result
+                            .get("missed_tx")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        // Parse returned tx records (each should correspond to a requested tx hash unless missed).
+                        if let Some(txs) = result.get("txs").and_then(|v| v.as_array()) {
+                            for tx in txs {
+                                let txid = match tx.get("tx_hash").and_then(|h| h.as_str()) {
+                                    Some(s) => s.to_string(),
+                                    None => continue,
+                                };
+
+                                // If daemon doesn't know the tx, skip.
+                                if missed.contains(&txid) {
+                                    continue;
+                                }
+
+                                // Default behavior: if we can't parse in_pool, be conservative and keep pending.
+                                let in_pool = tx.get("in_pool").and_then(|v| v.as_bool());
+                                let block_height = tx.get("block_height").and_then(|v| v.as_u64());
+
+                                if let Some(entry) = computed_ledger.get_mut(&txid) {
+                                    if entry.direction == "out" {
+                                        match in_pool {
+                                            Some(true) => {
+                                                // Still in mempool; keep pending.
+                                                entry.is_pending = true;
+                                                // Do not set height.
+                                            }
+                                            Some(false) => {
+                                                // Mined.
+                                                entry.is_pending = false;
+
+                                                // Record mined height (if available)
+                                                if entry.height.is_none() || entry.height == Some(0)
+                                                {
+                                                    entry.height = block_height.filter(|h| *h > 0);
+                                                }
+
+                                                // Fetch mined block timestamp via get_block_header_by_height.
+                                                // If this fails, fall back to daemon top timestamp.
+                                                if entry.timestamp.is_none() {
+                                                    if let Some(h) = entry.height {
+                                                        let header_res = rpc_client.json_rpc_call(
+                                                            "get_block_header_by_height",
+                                                            serde_json::json!({ "height": h }),
+                                                        );
+                                                        if let Ok(v) = header_res {
+                                                            if let Some(ts) = v
+                                                                .get("result")
+                                                                .and_then(|r| r.get("block_header"))
+                                                                .and_then(|bh| bh.get("timestamp"))
+                                                                .and_then(|t| t.as_u64())
+                                                            {
+                                                                entry.timestamp = Some(ts);
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if entry.timestamp.is_none()
+                                                        && daemon.top_block_timestamp > 0
+                                                    {
+                                                        entry.timestamp =
+                                                            Some(daemon.top_block_timestamp);
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                // Unknown; keep pending to avoid mislabeling mempool txs as confirmed.
+                                                entry.is_pending = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Defensive fallback: if a requested tx is not missed and we have no txs array details,
+                        // do NOT mark it confirmed (to avoid treating mempool as confirmed). We only ever clear
+                        // pending status here when we can observe in_pool == false or we confirm via output scanning.
+                        //
+                        // (No-op by design.)
+                        let _ = missed;
+                    }
+                }
+                Err((_code, _msg)) => {
+                    // Ignore: node may not support the method or may be temporarily unavailable.
+                    // Pending entries will still confirm via the on-chain output heuristic when possible.
+                }
+            }
+        }
+    }
+
+    // Drop pending_outgoing entries that are now confirmed in the ledger.
+    let mut pending_outgoing = snapshot.pending_outgoing.clone();
+    pending_outgoing.retain(|p| {
+        if let Some(entry) = computed_ledger.get(&p.txid) {
+            entry.direction == "out" && entry.is_pending
+        } else {
+            true
+        }
+    });
+
     let mut total = 0u64;
     let mut unlocked = 0u64;
     for output in &working_outputs {
@@ -1652,6 +1938,8 @@ pub extern "C" fn wallet_refresh(
         }
         state.tracked_outputs = working_outputs;
         state.seen_outpoints = seen_outpoints;
+        state.tx_ledger = computed_ledger;
+        state.pending_outgoing = pending_outgoing;
     }
 
     if !out_last_scanned.is_null() {
@@ -2034,6 +2322,99 @@ pub extern "C" fn wallet_export_outputs_json(wallet_id: *const c_char) -> *mut c
             record_error(
                 -16,
                 "wallet_export_outputs_json: JSON contained interior null bytes",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wallet_list_transfers_json(wallet_id: *const c_char) -> *mut c_char {
+    clear_last_error();
+
+    if wallet_id.is_null() {
+        record_error(-11, "wallet_list_transfers_json: invalid wallet_id");
+        return ptr::null_mut();
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            record_error(-10, "wallet_list_transfers_json: invalid wallet_id utf8");
+            return ptr::null_mut();
+        }
+    };
+
+    let transfers: Vec<ObservedTransfer> = {
+        let map = WALLET_STORE.lock().expect("wallet store poisoned");
+        let Some(state) = map.get(id) else {
+            record_error(
+                -13,
+                format!("wallet_list_transfers_json: wallet '{id}' not opened"),
+            );
+            return ptr::null_mut();
+        };
+
+        // Build rows from the persisted transfer ledger so history remains stable even after outputs are spent.
+        let mut rows: Vec<ObservedTransfer> = Vec::new();
+
+        for entry in state.tx_ledger.values() {
+            let height = entry.height.unwrap_or(0);
+            let confirmations = if entry.is_pending {
+                0
+            } else {
+                confirmations_for_height(state.chain_height, height)
+            };
+
+            rows.push(ObservedTransfer {
+                txid: entry.txid.clone(),
+                direction: entry.direction.clone(),
+                amount: entry.amount,
+                fee: entry.fee,
+                height: entry.height,
+                timestamp: entry.timestamp,
+                confirmations,
+                is_pending: entry.is_pending,
+                subaddress_major: None,
+                subaddress_minor: None,
+            });
+        }
+
+        // Sort: pending first (newest first), then confirmed by height desc.
+        rows.sort_by(|a, b| match (a.is_pending, b.is_pending) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let ah = a.height.unwrap_or(0);
+                let bh = b.height.unwrap_or(0);
+                bh.cmp(&ah)
+                    .then_with(|| b.timestamp.unwrap_or(0).cmp(&a.timestamp.unwrap_or(0)))
+            }
+        });
+
+        rows
+    };
+
+    let json = match serde_json::to_string(&transfers) {
+        Ok(s) => s,
+        Err(err) => {
+            record_error(
+                -16,
+                format!("wallet_list_transfers_json: serialization failed ({err})"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    match CString::new(json) {
+        Ok(cstr) => {
+            clear_last_error();
+            cstr.into_raw()
+        }
+        Err(_) => {
+            record_error(
+                -16,
+                "wallet_list_transfers_json: JSON contained interior null bytes",
             );
             ptr::null_mut()
         }
@@ -2516,6 +2897,35 @@ pub extern "C" fn wallet_send(
     // Return result JSON with txid and fee
     let tx_hash = tx.hash();
     let hex = hex_lowercase(&tx_hash);
+
+    // Record a pending outgoing tx for UI history.
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        if let Some(state) = map.get_mut(id) {
+            state.pending_outgoing.push(PendingOutgoingTx {
+                txid: hex.clone(),
+                amount: amount_piconero,
+                fee: fee_piconero,
+                created_at: state.chain_time,
+            });
+
+            // Update stable transfer ledger (outgoing is pending until confirmed by refresh).
+            state.tx_ledger.insert(
+                hex.clone(),
+                LedgerEntry {
+                    txid: hex.clone(),
+                    direction: "out".to_string(),
+                    amount: amount_piconero,
+                    fee: Some(fee_piconero),
+                    height: None,
+                    timestamp: Some(state.chain_time),
+                    is_pending: true,
+                    is_coinbase: false,
+                },
+            );
+        }
+    }
+
     let result_json = match serde_json::to_string(&serde_json::json!({
         "txid": hex,
         "fee": fee_piconero
@@ -3982,6 +4392,40 @@ pub extern "C" fn wallet_sweep_with_filter(
 
     // Note: `fee` is used below; keep it as part of the decoded struct to avoid relying on string parsing.
 
+    // Record a pending outgoing tx for UI history.
+    {
+        let mut map = WALLET_STORE.lock().expect("wallet store poisoned");
+        // wallet_send_with_filter already used `wallet_id`, so we can reuse it here.
+        let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+            Ok(s) => s.trim(),
+            Err(_) => "",
+        };
+        if !id.is_empty() {
+            if let Some(state) = map.get_mut(id) {
+                state.pending_outgoing.push(PendingOutgoingTx {
+                    txid: send_res.txid.clone(),
+                    amount: preview.amount,
+                    fee: send_res.fee,
+                    created_at: state.chain_time,
+                });
+
+                // Update stable transfer ledger (outgoing is pending until confirmed by refresh).
+                state.tx_ledger.insert(
+                    send_res.txid.clone(),
+                    LedgerEntry {
+                        txid: send_res.txid.clone(),
+                        direction: "out".to_string(),
+                        amount: preview.amount,
+                        fee: Some(send_res.fee),
+                        height: None,
+                        timestamp: Some(state.chain_time),
+                        is_pending: true,
+                        is_coinbase: false,
+                    },
+                );
+            }
+        }
+    }
     let result_json = match serde_json::to_string(&serde_json::json!({
         "txid": send_res.txid,
         "amount": preview.amount,

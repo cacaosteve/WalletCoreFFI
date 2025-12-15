@@ -188,6 +188,33 @@ char* wallet_export_outputs_json(
 );
 
 
+/* ===== Transfers: history ===== */
+
+/*
+ * List transfers (transaction-level history) as a JSON string.
+ * Returns a newly-allocated char*; caller must free with walletcore_free_cstr.
+ *
+ * Intended schema (subject to evolution):
+ * [
+ *   {
+ *     "txid": "<hex>",
+ *     "direction": "in" | "out" | "self",
+ *     "amount": <uint64>,          // piconero (net for out may be represented as positive with direction)
+ *     "fee": <uint64|null>,        // piconero, present for outgoing
+ *     "height": <uint64|null>,     // confirmed height
+ *     "timestamp": <uint64|null>,  // seconds since epoch if known
+ *     "confirmations": <uint64>,   // 0 if pending
+ *     "is_pending": <bool>,
+ *     "subaddress_major": <uint32|null>,
+ *     "subaddress_minor": <uint32|null>
+ *   },
+ *   ...
+ * ]
+ */
+char* wallet_list_transfers_json(
+    const char* wallet_id
+);
+
 /* ===== Transfers: preview/send ===== */
 
 /*
