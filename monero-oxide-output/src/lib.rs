@@ -1075,6 +1075,21 @@ impl PersistedWallet {
         if state.tx_ledger.is_empty() {
             state.tx_ledger = HashMap::new();
         }
+
+        // Invariant enforcement:
+        // Cache blobs may have been exported mid-refresh (or from older versions), which can result in
+        // tracked outputs/ledger being present while total/unlocked are stale (e.g., 0).
+        // Recompute balances from the imported tracked outputs using the imported chain height/time.
+        let mut total: u64 = 0;
+        let mut unlocked: u64 = 0;
+        for o in state.tracked_outputs.iter() {
+            total = total.saturating_add(o.amount);
+            if o.is_unlocked(state.chain_height, state.chain_time) {
+                unlocked = unlocked.saturating_add(o.amount);
+            }
+        }
+        state.total = total;
+        state.unlocked = unlocked;
     }
 }
 
