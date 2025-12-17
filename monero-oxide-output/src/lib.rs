@@ -10,9 +10,11 @@ use std::{
     time::Duration,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::AtomicU64,
     mpsc::{self, TryRecvError},
 };
 
@@ -44,8 +46,26 @@ const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+/// Global cancellation flag for `wallet_refresh` / `wallet_refresh_async`.
+/// This is best-effort: the refresh loop checks it frequently and aborts promptly.
+///
+/// NOTE: This is process-global, not per-wallet. If you need per-wallet cancel,
+/// we can evolve this into a `HashMap<wallet_id, AtomicBool>` behind a Mutex.
+static REFRESH_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 static ZMQ_RUNTIME: Lazy<Mutex<Option<ZmqRuntime>>> = Lazy::new(|| Mutex::new(None));
+
+#[inline]
+fn refresh_cancelled() -> bool {
+    REFRESH_CANCEL_REQUESTED.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn reset_refresh_cancel() {
+    REFRESH_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+}
 
 fn set_last_error<S: Into<String>>(message: S) {
     if let Ok(mut slot) = LAST_ERROR_MESSAGE.lock() {
@@ -96,6 +116,19 @@ pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
             .into_raw(),
         None => std::ptr::null_mut(),
     }
+}
+
+/// Request cancellation of any in-flight refresh.
+///
+/// This sets a global flag that the refresh loop checks frequently. The next
+/// check will abort the refresh with a cancellation error.
+///
+/// Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn wallet_refresh_cancel() -> c_int {
+    clear_last_error();
+    REFRESH_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    0
 }
 
 struct MasterKeys {
@@ -1302,6 +1335,13 @@ pub extern "C" fn wallet_refresh(
     out_last_scanned: *mut u64,
 ) -> c_int {
     clear_last_error();
+    // Reset any prior cancellation request at the beginning of a refresh.
+    reset_refresh_cancel();
+
+    // If cancellation was requested before we even start, abort immediately.
+    if refresh_cancelled() {
+        return record_error(-30, "wallet_refresh: cancelled");
+    }
 
     if wallet_id.is_null() {
         return record_error(-11, "wallet_refresh: wallet_id pointer was null");
@@ -1969,6 +2009,14 @@ pub extern "C" fn wallet_refresh(
 #[no_mangle]
 pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *const c_char) -> c_int {
     clear_last_error();
+    // Reset any prior cancellation request at the beginning of a refresh.
+    reset_refresh_cancel();
+
+    // If cancellation was requested before we even start, abort immediately.
+    if refresh_cancelled() {
+        return record_error(-30, "wallet_refresh_async: cancelled");
+    }
+
     if wallet_id.is_null() {
         return record_error(-11, "wallet_refresh_async: wallet_id pointer was null");
     }
