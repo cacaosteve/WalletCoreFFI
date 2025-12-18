@@ -47,24 +47,39 @@ const COINBASE_LOCK_WINDOW: u64 = 60;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
-/// Global cancellation flag for `wallet_refresh` / `wallet_refresh_async`.
+/// Per-wallet cancellation flags for `wallet_refresh` / `wallet_refresh_async`.
 /// This is best-effort: the refresh loop checks it frequently and aborts promptly.
 ///
-/// NOTE: This is process-global, not per-wallet. If you need per-wallet cancel,
-/// we can evolve this into a `HashMap<wallet_id, AtomicBool>` behind a Mutex.
-static REFRESH_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Keyed by `wallet_id` string.
+static REFRESH_CANCEL_FLAGS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 static ZMQ_RUNTIME: Lazy<Mutex<Option<ZmqRuntime>>> = Lazy::new(|| Mutex::new(None));
 
 #[inline]
-fn refresh_cancelled() -> bool {
-    REFRESH_CANCEL_REQUESTED.load(Ordering::Relaxed)
+fn refresh_cancel_flag_for_wallet(wallet_id: &str) -> Arc<AtomicBool> {
+    let mut map = REFRESH_CANCEL_FLAGS
+        .lock()
+        .expect("refresh cancel flags lock poisoned");
+    match map.entry(wallet_id.to_string()) {
+        Entry::Occupied(e) => e.get().clone(),
+        Entry::Vacant(v) => {
+            let flag = Arc::new(AtomicBool::new(false));
+            v.insert(flag.clone());
+            flag
+        }
+    }
 }
 
 #[inline]
-fn reset_refresh_cancel() {
-    REFRESH_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+fn refresh_cancelled_for_wallet(wallet_id: &str) -> bool {
+    refresh_cancel_flag_for_wallet(wallet_id).load(Ordering::Relaxed)
+}
+
+#[inline]
+fn set_refresh_cancel_for_wallet(wallet_id: &str, cancelled: bool) {
+    refresh_cancel_flag_for_wallet(wallet_id).store(cancelled, Ordering::Relaxed);
 }
 
 fn set_last_error<S: Into<String>>(message: S) {
@@ -118,16 +133,35 @@ pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
     }
 }
 
-/// Request cancellation of any in-flight refresh.
+/// Request cancellation of the in-flight refresh for a specific wallet.
 ///
-/// This sets a global flag that the refresh loop checks frequently. The next
+/// This sets a per-wallet flag that the refresh loop checks frequently. The next
 /// check will abort the refresh with a cancellation error.
 ///
 /// Returns 0 on success.
 #[no_mangle]
-pub extern "C" fn wallet_refresh_cancel() -> c_int {
+pub extern "C" fn wallet_refresh_cancel(wallet_id: *const c_char) -> c_int {
     clear_last_error();
-    REFRESH_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+
+    if wallet_id.is_null() {
+        return record_error(-11, "wallet_refresh_cancel: wallet_id pointer was null");
+    }
+
+    let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => {
+            return record_error(
+                -10,
+                "wallet_refresh_cancel: wallet_id contained invalid UTF-8",
+            )
+        }
+    };
+
+    if id.is_empty() {
+        return record_error(-14, "wallet_refresh_cancel: wallet_id was empty");
+    }
+
+    set_refresh_cancel_for_wallet(id, true);
     0
 }
 
@@ -1335,13 +1369,6 @@ pub extern "C" fn wallet_refresh(
     out_last_scanned: *mut u64,
 ) -> c_int {
     clear_last_error();
-    // Reset any prior cancellation request at the beginning of a refresh.
-    reset_refresh_cancel();
-
-    // If cancellation was requested before we even start, abort immediately.
-    if refresh_cancelled() {
-        return record_error(-30, "wallet_refresh: cancelled");
-    }
 
     if wallet_id.is_null() {
         return record_error(-11, "wallet_refresh: wallet_id pointer was null");
@@ -1351,6 +1378,19 @@ pub extern "C" fn wallet_refresh(
         Ok(s) => s.trim(),
         Err(_) => return record_error(-11, "wallet_refresh: wallet_id contained invalid UTF-8"),
     };
+
+    if id.is_empty() {
+        return record_error(-14, "wallet_refresh: wallet_id was empty");
+    }
+
+    // If cancellation was requested before we even start, abort immediately.
+    if refresh_cancelled_for_wallet(id) {
+        return record_error(-30, "wallet_refresh: cancelled");
+    }
+
+    // Clear any stale cancellation request once we have decided to start.
+    // This ensures a prior cancel doesn't accidentally cancel a new refresh later.
+    set_refresh_cancel_for_wallet(id, false);
 
     let arg_url = if !node_url.is_null() {
         unsafe { CStr::from_ptr(node_url) }
@@ -1482,6 +1522,11 @@ pub extern "C" fn wallet_refresh(
         if par > 1 && batch > 1 {
             // Parallel, batched scanning. Each worker uses its own Scanner cloned from the same view_pair.
             while scan_cursor < daemon.height {
+                // Cancellation check (per-wallet)
+                if refresh_cancelled_for_wallet(id) {
+                    return record_error(-30, "wallet_refresh: cancelled");
+                }
+
                 let end_exclusive = {
                     let end = scan_cursor.saturating_add(batch as u64);
                     if end > daemon.height {
@@ -1505,6 +1550,11 @@ pub extern "C" fn wallet_refresh(
                 // Launch workers in chunks of `par`
                 for chunk in heights.chunks(par) {
                     for &h in chunk {
+                        // Cancellation check (per-wallet) before spawning more work
+                        if refresh_cancelled_for_wallet(id) {
+                            return record_error(-30, "wallet_refresh: cancelled");
+                        }
+
                         let txc = tx.clone();
                         let client = rpc_client.clone();
                         let vp = view_pair.clone();
@@ -1513,7 +1563,15 @@ pub extern "C" fn wallet_refresh(
                         let end_ex = end_exclusive;
                         let bulk_mode = bulk;
                         let worker_span = worker_blocks as u64;
+                        let id_owned_for_worker = id.to_string();
                         std::thread::spawn(move || {
+                            // Early exit if cancelled before worker begins
+                            if refresh_cancelled_for_wallet(&id_owned_for_worker) {
+                                let _ =
+                                    txc.send(Err((-30, "wallet_refresh: cancelled".to_string())));
+                                return;
+                            }
+
                             // Local scanner per worker
                             let mut local_scanner = Scanner::new(vp);
                             if let Some(i0) = SubaddressIndex::new(0, 0) {
@@ -1535,6 +1593,13 @@ pub extern "C" fn wallet_refresh(
 
                             let mut collected: Vec<TrackedOutput> = Vec::new();
                             for th in start_height..end_height_exclusive {
+                                // Cancellation check (per-wallet) inside worker loop
+                                if refresh_cancelled_for_wallet(&id_owned_for_worker) {
+                                    let _ = txc
+                                        .send(Err((-30, "wallet_refresh: cancelled".to_string())));
+                                    return;
+                                }
+
                                 let block_number = match usize::try_from(th) {
                                     Ok(v) => v,
                                     Err(_) => {
@@ -1606,8 +1671,18 @@ pub extern "C" fn wallet_refresh(
                     let mut received = 0usize;
                     let worker_timeout = std::time::Duration::from_secs(120);
                     while received < chunk.len() {
+                        // Cancellation check (per-wallet) while waiting on workers
+                        if refresh_cancelled_for_wallet(id) {
+                            return record_error(-30, "wallet_refresh: cancelled");
+                        }
+
                         match rx.recv_timeout(worker_timeout) {
                             Ok(Ok(vec_outputs)) => {
+                                // Cancellation check before applying results
+                                if refresh_cancelled_for_wallet(id) {
+                                    return record_error(-30, "wallet_refresh: cancelled");
+                                }
+
                                 for t in vec_outputs {
                                     let key = (t.tx_hash, t.index_in_tx);
                                     if !seen_outpoints.insert(key) {
@@ -1618,7 +1693,7 @@ pub extern "C" fn wallet_refresh(
                                 received += 1;
                             }
                             Ok(Err((code, msg))) => {
-                                // Abort on first error
+                                // Abort on first error (including cancellation)
                                 return record_error(code, msg);
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1670,6 +1745,11 @@ pub extern "C" fn wallet_refresh(
         } else {
             // Sequential scan (original path)
             while scan_cursor < daemon.height {
+                // Cancellation check (per-wallet)
+                if refresh_cancelled_for_wallet(id) {
+                    return record_error(-30, "wallet_refresh: cancelled");
+                }
+
                 let block_number = match usize::try_from(scan_cursor) {
                     Ok(value) => value,
                     Err(_) => {
@@ -2009,13 +2089,6 @@ pub extern "C" fn wallet_refresh(
 #[no_mangle]
 pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *const c_char) -> c_int {
     clear_last_error();
-    // Reset any prior cancellation request at the beginning of a refresh.
-    reset_refresh_cancel();
-
-    // If cancellation was requested before we even start, abort immediately.
-    if refresh_cancelled() {
-        return record_error(-30, "wallet_refresh_async: cancelled");
-    }
 
     if wallet_id.is_null() {
         return record_error(-11, "wallet_refresh_async: wallet_id pointer was null");
@@ -2032,8 +2105,16 @@ pub extern "C" fn wallet_refresh_async(wallet_id: *const c_char, node_url: *cons
     };
 
     if id_str.is_empty() {
-        return record_error(-10, "wallet_refresh_async: wallet_id was empty");
+        return record_error(-14, "wallet_refresh_async: wallet_id was empty");
     }
+
+    // If cancellation was requested before we even start, abort immediately.
+    if refresh_cancelled_for_wallet(id_str) {
+        return record_error(-30, "wallet_refresh_async: cancelled");
+    }
+
+    // Clear any stale cancellation request once we have decided to start.
+    set_refresh_cancel_for_wallet(id_str, false);
 
     let id_owned = id_str.to_string();
 

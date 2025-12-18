@@ -159,14 +159,14 @@ int32_t wallet_refresh_async(
 );
 
 /*
- * Request cancellation of any in-flight refresh.
+ * Request cancellation of the in-flight refresh for a specific wallet.
  *
- * NOTE: Currently implemented as a process-global cancel flag in the Rust core.
- * This cancels the active refresh loop at the next cancellation check.
+ * This sets a per-wallet cancel flag that the refresh loop checks frequently.
+ * The next check will abort the refresh with a cancellation error.
  *
  * Returns 0 on success.
  */
-int32_t wallet_refresh_cancel(void);
+int32_t wallet_refresh_cancel(const char* wallet_id);
 
 /*
  * Retrieve current sync status for a wallet.
