@@ -524,18 +524,85 @@ impl EpeeObject for GetBlocksByHeightBinRequest {
     }
 }
 
-/// Minimal response model for monerod `/get_blocks_by_height.bin`.
-/// We only decode the fields we need for scanning: `blocks`, `status`, and `untrusted`.
+/*
+ * Request for monerod `/get_blocks.bin` (portable_storage / EPEE encoded).
+ *
+ * We only support contiguous ranges for fast scanning:
+ * - start_height: u64
+ * - count: u64
+ * - prune: bool
+ */
 #[derive(Clone, Debug)]
-struct GetBlocksByHeightBinResponse {
-    blocks: Vec<BlockCompleteEntry>,
-    status: Option<String>,
-    untrusted: Option<bool>,
+struct GetBlocksBinRequest {
+    start_height: u64,
+    count: u64,
+    prune: bool,
 }
 
+#[derive(Default)]
+struct GetBlocksBinRequestBuilder {
+    start_height: Option<u64>,
+    count: Option<u64>,
+    prune: Option<bool>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinRequest> for GetBlocksBinRequestBuilder {
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "start_height" => {
+                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "count" => {
+                self.count = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "prune" => {
+                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<GetBlocksBinRequest> {
+        Ok(GetBlocksBinRequest {
+            start_height: self.start_height.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field start_height missing")
+            })?,
+            count: self.count.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field count missing")
+            })?,
+            prune: self.prune.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field prune missing")
+            })?,
+        })
+    }
+}
+
+impl EpeeObject for GetBlocksBinRequest {
+    type Builder = GetBlocksBinRequestBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        3
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.start_height, "start_height", w)?;
+        write_field(self.count, "count", w)?;
+        write_field(self.prune, "prune", w)?;
+        Ok(())
+    }
+}
+
+/// Shared block entry for `get_blocks_by_height.bin` and (typically) `get_blocks.bin`.
 #[derive(Clone, Debug)]
 struct BlockCompleteEntry {
     block: Vec<u8>,
+    // Some daemons (or prune modes) omit tx blobs in certain responses.
+    // When omitted, we treat it as an empty list and let the caller decide whether to fall back.
     txs: Vec<Vec<u8>>,
 }
 
@@ -568,9 +635,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
             block: self.block.ok_or_else(|| {
                 cuprate_epee_encoding::error::Error::Format("block_complete_entry missing 'block'")
             })?,
-            txs: self.txs.ok_or_else(|| {
-                cuprate_epee_encoding::error::Error::Format("block_complete_entry missing 'txs'")
-            })?,
+            txs: self.txs.unwrap_or_default(),
         })
     }
 }
@@ -587,6 +652,15 @@ impl EpeeObject for BlockCompleteEntry {
         write_field(self.txs, "txs", w)?;
         Ok(())
     }
+}
+
+/// Minimal response model for monerod `/get_blocks_by_height.bin`.
+/// We only decode the fields we need for scanning: `blocks`, `status`, and `untrusted`.
+#[derive(Clone, Debug)]
+struct GetBlocksByHeightBinResponse {
+    blocks: Vec<BlockCompleteEntry>,
+    status: Option<String>,
+    untrusted: Option<bool>,
 }
 
 #[derive(Default)]
@@ -632,6 +706,77 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksByHeightBinResponse>
 
 impl EpeeObject for GetBlocksByHeightBinResponse {
     type Builder = GetBlocksByHeightBinResponseBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        3
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.blocks, "blocks", w)?;
+        if let Some(status) = self.status {
+            write_field(status, "status", w)?;
+        }
+        if let Some(untrusted) = self.untrusted {
+            write_field(untrusted, "untrusted", w)?;
+        }
+        Ok(())
+    }
+}
+
+/*
+ * Minimal response model for monerod `/get_blocks.bin`.
+ * We only decode what we need: `blocks`, `status`, `untrusted`.
+ */
+#[derive(Clone, Debug)]
+struct GetBlocksBinResponse {
+    blocks: Vec<BlockCompleteEntry>,
+    status: Option<String>,
+    untrusted: Option<bool>,
+}
+
+#[derive(Default)]
+struct GetBlocksBinResponseBuilder {
+    blocks: Option<Vec<BlockCompleteEntry>>,
+    status: Option<String>,
+    untrusted: Option<bool>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
+    for GetBlocksBinResponseBuilder
+{
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "blocks" => {
+                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "status" => {
+                self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "untrusted" => {
+                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<GetBlocksBinResponse> {
+        Ok(GetBlocksBinResponse {
+            blocks: self.blocks.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("response missing 'blocks'")
+            })?,
+            status: self.status,
+            untrusted: self.untrusted,
+        })
+    }
+}
+
+impl EpeeObject for GetBlocksBinResponse {
+    type Builder = GetBlocksBinResponseBuilder;
 
     fn number_of_fields(&self) -> u64 {
         3
@@ -742,6 +887,27 @@ impl BlockingRpcTransport {
         let resp_bytes = self.post_bin("get_blocks_by_height.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksByHeightBinResponse = from_bytes(&mut reader)
+            .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
+        Ok(resp)
+    }
+
+    fn get_blocks_bin(
+        &self,
+        start_height: u64,
+        count: u64,
+        prune: bool,
+    ) -> Result<GetBlocksBinResponse, RpcError> {
+        let req = GetBlocksBinRequest {
+            start_height,
+            count,
+            prune,
+        };
+        let body = to_bytes(req)
+            .map(|b| b.to_vec())
+            .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+        let resp_bytes = self.post_bin("get_blocks.bin", body)?;
+        let mut reader: &[u8] = resp_bytes.as_slice();
+        let resp: GetBlocksBinResponse = from_bytes(&mut reader)
             .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
         Ok(resp)
     }
@@ -2065,45 +2231,29 @@ pub extern "C" fn wallet_refresh(
                     BulkFetchMode::BinByHeight => {
                         if !bulk_fetch_logged {
                             print!(
-                                "🧱 bulk-fetch(bin)=on batch={} clearnet={}\n",
+                                "🧱 bulk-fetch(bin:get_blocks)=on batch={} clearnet={}\n",
                                 bulk_fetch_batch, clearnet_scan
                             );
                             bulk_fetch_logged = true;
                         }
 
-                        // Build batch heights [scan_cursor .. end_exclusive)
+                        // Fetch contiguous range via get_blocks.bin (preferred for full tx blobs)
                         let end_exclusive = daemon
                             .height
                             .min(scan_cursor.saturating_add(bulk_fetch_batch as u64));
-                        let mut heights: Vec<u64> = Vec::with_capacity(
-                            (end_exclusive.saturating_sub(scan_cursor)) as usize,
-                        );
-                        let mut h = scan_cursor;
-                        while h < end_exclusive {
-                            heights.push(h);
-                            h += 1;
-                        }
+                        let count = end_exclusive.saturating_sub(scan_cursor);
 
-                        // Fetch batch via *.bin
-                        let resp = match rpc_client.get_blocks_by_height_bin(heights, false) {
+                        let resp = match rpc_client.get_blocks_bin(scan_cursor, count, false) {
                             Ok(r) => r,
                             Err(err) => {
                                 if !bulk_fetch_fallback_logged {
                                     print!(
-                                        "🧱 bulk-fetch(bin) failed; falling back to per-block: {}\n",
+                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: {}\n",
                                         err
                                     );
                                     bulk_fetch_fallback_logged = true;
                                 }
-                                // Switch to per-block for remainder of refresh
-                                // (continue loop, but using per-block code path)
-                                // Note: we do not mutate env or global settings here.
-                                // Fall through to per-block processing below.
-                                // We accomplish this by temporarily handling this height via per-block
-                                // and then continuing with per-block mode for subsequent heights.
-                                //
-                                // We keep it simple: process current height via per-block and then
-                                // set effective_bulk_fetch to PerBlock by shadowing with a local var.
+                                // Process current height via per-block, then continue (we'll keep falling back)
                                 let block_number = match usize::try_from(scan_cursor) {
                                     Ok(v) => v,
                                     Err(_) => {
@@ -2170,18 +2320,11 @@ pub extern "C" fn wallet_refresh(
                                     daemon.top_block_timestamp,
                                     snapshot.restore_height,
                                 );
-                                // Continue scanning sequentially using per-block only
-                                // by forcing bulk_fetch_fallback_logged and falling through on next iterations.
-                                //
-                                // We can't mutate `effective_bulk_fetch` (it isn't mutable),
-                                // so we just always take PerBlock below once fallback has occurred.
                                 continue;
                             }
                         };
 
-                        // Process returned entries sequentially. Note: we assume the daemon returns blocks
-                        // in the same order as requested heights. If not, we'll still advance scan_cursor
-                        // conservatively by one per successfully processed entry.
+                        // Process returned entries sequentially (one per height starting at scan_cursor).
                         for entry in resp.blocks {
                             if refresh_cancelled_for_wallet(id) {
                                 return record_error(-30, "wallet_refresh: cancelled");
@@ -2194,13 +2337,24 @@ pub extern "C" fn wallet_refresh(
                                 Err(_) => {
                                     if !bulk_fetch_fallback_logged {
                                         print!(
-                                            "🧱 bulk-fetch(bin) failed; falling back to per-block: block parse failed\n"
+                                            "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: block parse failed\n"
                                         );
                                         bulk_fetch_fallback_logged = true;
                                     }
                                     break;
                                 }
                             };
+
+                            // Require tx blobs (get_blocks.bin should provide them when prune=false).
+                            if entry.txs.is_empty() {
+                                if !bulk_fetch_fallback_logged {
+                                    print!(
+                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: response omitted tx blobs\n"
+                                    );
+                                    bulk_fetch_fallback_logged = true;
+                                }
+                                break;
+                            }
 
                             // Parse tx blobs (pruned)
                             let mut parsed_txs: Vec<Transaction<Pruned>> =
@@ -2219,14 +2373,14 @@ pub extern "C" fn wallet_refresh(
                             if tx_parse_failed {
                                 if !bulk_fetch_fallback_logged {
                                     print!(
-                                        "🧱 bulk-fetch(bin) failed; falling back to per-block: tx parse failed\n"
+                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: tx parse failed\n"
                                     );
                                     bulk_fetch_fallback_logged = true;
                                 }
                                 break;
                             }
 
-                            // Compute output_index_for_first_ringct_output (A1) using get_o_indexes.bin (already optimized).
+                            // Compute output_index_for_first_ringct_output (A1) using get_o_indexes.bin.
                             let mut output_index_for_first_ringct_output: Option<u64> = None;
                             let miner_tx_hash = parsed_block.miner_transaction().hash();
                             let miner_tx = Transaction::<Pruned>::from(
@@ -2245,13 +2399,11 @@ pub extern "C" fn wallet_refresh(
                                     Err(err) => {
                                         if !bulk_fetch_fallback_logged {
                                             print!(
-                                                "🧱 bulk-fetch(bin) failed; falling back to per-block: get_o_indexes failed ({})\n",
+                                                "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: get_o_indexes failed ({})\n",
                                                 err
                                             );
                                             bulk_fetch_fallback_logged = true;
                                         }
-                                        // Stop processing batch; outer loop will fall back to per-block.
-                                        output_index_for_first_ringct_output = None;
                                         break;
                                     }
                                 };
@@ -2315,7 +2467,6 @@ pub extern "C" fn wallet_refresh(
                             );
                         }
 
-                        // If we hit a parse/index failure and logged fallback, continue with per-block mode.
                         if bulk_fetch_fallback_logged {
                             continue;
                         }
