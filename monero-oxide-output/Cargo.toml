@@ -18,6 +18,17 @@ sha3 = { version = "0.10", default-features = false, features = ["std"] }
 zeroize = { version = "1.5", default-features = false, features = ["zeroize_derive", "std"] }
 curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize"] }
 monero-io = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-io", features = ["std"] }
+monero-epee = { git = "https://github.com/monero-oxide/monero-oxide", package = "monero-epee" }
+
+
+
+# Buf/BufMut traits used by cuprate-epee-encoding helpers in our debug tooling
+bytes = "1"
+
+# Portable storage (EPEE) encoder used to correctly construct monerod *.bin request bodies
+# (e.g. /get_blocks_by_height.bin) instead of hand-rolling the binary format.
+cuprate-epee-encoding = { git = "https://github.com/Cuprate/cuprate", package = "cuprate-epee-encoding" }
+
 once_cell = "1.19"
 ureq = { version = "2", features = ["tls", "json"] }
 futures = "0.3"

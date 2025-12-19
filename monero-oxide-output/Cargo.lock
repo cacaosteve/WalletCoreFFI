@@ -45,6 +45,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytes"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
+
+[[package]]
 name = "cc"
 version = "1.2.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +169,37 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "cuprate-epee-encoding"
+version = "0.5.0"
+source = "git+https://github.com/Cuprate/cuprate#27eec55f5b7851a2b36e158065a6be95c091e904"
+dependencies = [
+ "bytes",
+ "cuprate-fixed-bytes",
+ "cuprate-hex",
+ "paste",
+ "ref-cast",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "cuprate-fixed-bytes"
+version = "0.1.0"
+source = "git+https://github.com/Cuprate/cuprate#27eec55f5b7851a2b36e158065a6be95c091e904"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "cuprate-hex"
+version = "0.0.0"
+source = "git+https://github.com/Cuprate/cuprate#27eec55f5b7851a2b36e158065a6be95c091e904"
+dependencies = [
+ "hex",
+ "serde",
 ]
 
 [[package]]
@@ -435,6 +472,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hex-literal"
@@ -724,6 +764,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "monero-epee"
+version = "0.2.0"
+source = "git+https://github.com/monero-oxide/monero-oxide#aebc44f0c8dad70b1062e0d5ba88fb6b990fd515"
+
+[[package]]
 name = "monero-io"
 version = "0.1.0"
 source = "git+https://github.com/monero-oxide/monero-oxide#aebc44f0c8dad70b1062e0d5ba88fb6b990fd515"
@@ -833,6 +878,12 @@ name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "percent-encoding"
@@ -958,6 +1009,26 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "ref-cast"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f354300ae66f76f1c85c5f84693f0ce81d747e2c3f21a45fef496d89c960bf7d"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1366,10 +1437,13 @@ name = "walletcore"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bytes",
+ "cuprate-epee-encoding",
  "curve25519-dalek",
  "futures",
  "monero-address",
  "monero-ed25519",
+ "monero-epee",
  "monero-io",
  "monero-seed",
  "monero-wallet",
