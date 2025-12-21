@@ -6,11 +6,14 @@ use std::{
     io::Read,
     os::raw::{c_char, c_int},
     ptr, slice,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
-use std::sync::atomic::{AtomicBool, Ordering};
+// (moved into the main std::sync import above)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BulkFetchMode {
@@ -86,6 +89,10 @@ const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+/// One-time debug logging for `get_blocks.bin` / `get_blocks_by_height.bin` response schema discovery.
+/// We log unknown fields in `block_complete_entry` once so we can learn the actual tx blob field name.
+static BULK_BIN_UNKNOWN_FIELD_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Per-wallet cancellation flags for `wallet_refresh` / `wallet_refresh_async`.
 /// This is best-effort: the refresh loop checks it frequently and aborts promptly.
@@ -625,7 +632,17 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
             "txs" => {
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
-            _ => return Ok(false),
+            _ => {
+                // Schema discovery: log unknown fields once (they may include tx blob fields like
+                // "txs_blob", "txs_blobs", etc.). We only log once to avoid spam.
+                if !BULK_BIN_UNKNOWN_FIELD_LOGGED.swap(true, Ordering::Relaxed) {
+                    print!(
+                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')\n",
+                        name
+                    );
+                }
+                return Ok(false);
+            }
         }
         Ok(true)
     }
