@@ -124,6 +124,114 @@ fn bulk_bin_debug_enabled() -> bool {
 static REFRESH_CANCEL_FLAGS: Lazy<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Global throttling for `get_o_indexes.bin` calls to avoid overwhelming monerod and triggering
+/// `Connection reset by peer` under high scan concurrency.
+///
+/// Configure in Xcode Scheme env vars:
+/// - WALLETCORE_OINDEXES_CONCURRENCY=4   (default: 4, clamped 1..32)
+/// - WALLETCORE_OINDEXES_RETRIES=3       (default: 3, clamped 0..10)
+static OINDEXES_LIMIT: Lazy<Mutex<Option<std::sync::Arc<std::sync::Condvar>>>> =
+    Lazy::new(|| Mutex::new(None));
+static OINDEXES_IN_FLIGHT: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
+
+#[inline]
+fn oindexes_concurrency_from_env() -> usize {
+    let v = std::env::var("WALLETCORE_OINDEXES_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
+    v.clamp(1, 32)
+}
+
+#[inline]
+fn oindexes_retries_from_env() -> usize {
+    let v = std::env::var("WALLETCORE_OINDEXES_RETRIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(3);
+    v.clamp(0, 10)
+}
+
+#[inline]
+fn oindexes_backoff_ms(attempt: usize) -> u64 {
+    // 100ms, 250ms, 500ms, 1000ms...
+    match attempt {
+        0 => 100,
+        1 => 250,
+        2 => 500,
+        _ => 1000,
+    }
+}
+
+fn acquire_oindexes_slot() {
+    // Lazily create a shared Condvar for wakeups.
+    let cv = {
+        let mut opt = OINDEXES_LIMIT.lock().expect("OINDEXES_LIMIT lock poisoned");
+        opt.get_or_insert_with(|| std::sync::Arc::new(std::sync::Condvar::new()))
+            .clone()
+    };
+
+    let limit = oindexes_concurrency_from_env();
+    let mut in_flight = OINDEXES_IN_FLIGHT
+        .lock()
+        .expect("OINDEXES_IN_FLIGHT lock poisoned");
+    while *in_flight >= limit {
+        in_flight = cv
+            .wait(in_flight)
+            .expect("OINDEXES_IN_FLIGHT condvar wait failed");
+    }
+    *in_flight += 1;
+}
+
+fn release_oindexes_slot() {
+    let cv_opt = OINDEXES_LIMIT.lock().expect("OINDEXES_LIMIT lock poisoned");
+    if let Some(cv) = cv_opt.as_ref() {
+        let mut in_flight = OINDEXES_IN_FLIGHT
+            .lock()
+            .expect("OINDEXES_IN_FLIGHT lock poisoned");
+        if *in_flight > 0 {
+            *in_flight -= 1;
+        }
+        cv.notify_one();
+    }
+}
+
+fn is_transient_oindexes_error(err: &RpcError) -> bool {
+    let s = err.to_string().to_lowercase();
+    s.contains("connection reset")
+        || s.contains("reset by peer")
+        || s.contains("broken pipe")
+        || s.contains("timed out")
+        || s.contains("network error")
+}
+
+fn get_o_indexes_limited<R: Rpc>(rpc: &R, tx_hash: [u8; 32]) -> Result<Vec<u64>, RpcError> {
+    // Throttle + retry transient transport errors.
+    let retries = oindexes_retries_from_env();
+    for attempt in 0..=retries {
+        acquire_oindexes_slot();
+        let res = block_on(rpc.get_o_indexes(tx_hash));
+        release_oindexes_slot();
+
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < retries && is_transient_oindexes_error(&e) {
+                    std::thread::sleep(std::time::Duration::from_millis(oindexes_backoff_ms(
+                        attempt,
+                    )));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    // Unreachable, but Rust wants a return.
+    Err(RpcError::InternalError(
+        "get_o_indexes_limited: exhausted retries".to_string(),
+    ))
+}
+
 #[cfg(not(any(target_os = "ios", target_os = "tvos", target_os = "watchos")))]
 static ZMQ_RUNTIME: Lazy<Mutex<Option<ZmqRuntime>>> = Lazy::new(|| Mutex::new(None));
 
@@ -2155,23 +2263,26 @@ pub extern "C" fn wallet_refresh(
                                         }
                                     };
 
-                                    // If tx blobs are omitted, we can't scan from blobs.
-                                    if resp
-                                        .blocks
-                                        .first()
-                                        .map(|e| e.txs.is_empty())
-                                        .unwrap_or(true)
-                                    {
+                                    // Some daemons may omit tx blobs for some entries even when prune=false.
+                                    // Don't fail the whole span; we'll do per-height per-block fallback where needed.
+                                    if resp.blocks.is_empty() {
                                         let _ = txc.send(Err((
                                             -16,
-                                            "wallet_refresh: bulk get_blocks.bin omitted tx blobs"
-                                                .to_string(),
+                                            format!(
+                                                "wallet_refresh: bulk get_blocks.bin returned 0 blocks for heights {}..{}",
+                                                start_h,
+                                                end_h_exclusive.saturating_sub(1)
+                                            ),
                                         )));
                                         return;
                                     }
 
                                     // Scan each returned block entry in order. We assign heights sequentially
                                     // starting from start_h (daemon returns contiguous range).
+                                    //
+                                    // Some daemons may omit tx blobs for some entries even when prune=false.
+                                    // When that happens, fall back to the existing per-block scan for just that height
+                                    // instead of failing the whole span.
                                     let mut th = start_h;
                                     for entry in resp.blocks {
                                         if refresh_cancelled_for_wallet(&id_owned_for_worker) {
@@ -2180,6 +2291,74 @@ pub extern "C" fn wallet_refresh(
                                                 "wallet_refresh: cancelled".to_string(),
                                             )));
                                             return;
+                                        }
+
+                                        if entry.txs.is_empty() {
+                                            let block_number = match usize::try_from(th) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        "wallet_refresh: block number conversion overflow"
+                                                            .to_string(),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            let scannable = match block_on(
+                                                client.get_scannable_block_by_number(block_number),
+                                            ) {
+                                                Ok(block) => block,
+                                                Err(err) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        format!(
+                                                            "wallet_refresh: per-block fallback RPC block fetch failed at height {}: {}",
+                                                            th, err
+                                                        ),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            let miner_hash =
+                                                scannable.block.miner_transaction().hash();
+                                            let outputs = match local_scanner.scan(scannable) {
+                                                Ok(result) => result.ignore_additional_timelock(),
+                                                Err(_) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        format!(
+                                                            "wallet_refresh: scanner failed at height {}",
+                                                            th
+                                                        ),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            for output in outputs {
+                                                let (major, minor) = output
+                                                    .subaddress()
+                                                    .map(|idx| (idx.account(), idx.address()))
+                                                    .unwrap_or((0, 0));
+                                                collected.push(TrackedOutput {
+                                                    tx_hash: output.transaction(),
+                                                    index_in_tx: output.index_in_transaction(),
+                                                    amount: output.commitment().amount,
+                                                    block_height: th,
+                                                    additional_timelock: output
+                                                        .additional_timelock(),
+                                                    is_coinbase: output.transaction() == miner_hash,
+                                                    subaddress_major: major,
+                                                    subaddress_minor: minor,
+                                                    spent: false,
+                                                });
+                                            }
+
+                                            th = th.saturating_add(1);
+                                            continue;
                                         }
 
                                         let mut bb = entry.block.as_slice();
@@ -2235,7 +2414,7 @@ pub extern "C" fn wallet_refresh(
                                                 continue;
                                             }
 
-                                            let idxs = match block_on(client.get_o_indexes(*hash)) {
+                                            let idxs = match get_o_indexes_limited(&client, *hash) {
                                                 Ok(v) => v,
                                                 Err(err3) => {
                                                     let _ = txc.send(Err((
@@ -2729,7 +2908,7 @@ pub extern "C" fn wallet_refresh(
                                 {
                                     continue;
                                 }
-                                let idxs = match block_on(rpc_client.get_o_indexes(*hash)) {
+                                let idxs = match get_o_indexes_limited(&rpc_client, *hash) {
                                     Ok(v) => v,
                                     Err(err) => {
                                         if !bulk_fetch_fallback_logged {
