@@ -17,26 +17,44 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BulkFetchMode {
-    /// Fetch blocks one-by-one using JSON RPC (current behavior).
+    /// Fetch blocks one-by-one using JSON RPC (baseline behavior).
     PerBlock,
-    /// Fetch blocks in batches using monerod binary endpoints (get_blocks_by_height.bin).
-    BinByHeight,
+    /// Wallet2-style bulk sync using monerod binary endpoint `getblocks.bin` (blocks + output_indices).
+    Wallet2FastBlocks,
+    /// Range-based bulk fetch using monerod binary endpoint `get_blocks.bin` (blocks + tx blobs).
+    RangeBlocks,
 }
 
 #[inline]
 fn bulk_fetch_mode_from_env() -> BulkFetchMode {
-    // Default ON (bin) unless explicitly disabled.
-    // WALLETCORE_BULK_FETCH=0 => PerBlock
-    // WALLETCORE_BULK_FETCH=1 => BinByHeight
-    let enabled = std::env::var("WALLETCORE_BULK_FETCH")
+    // Bulk mode selection:
+    //
+    // - WALLETCORE_BULK_MODE=wallet2  => Wallet2FastBlocks (default)
+    // - WALLETCORE_BULK_MODE=range    => RangeBlocks
+    // - WALLETCORE_BULK_MODE=off      => PerBlock
+    //
+    // Back-compat:
+    // - WALLETCORE_BULK_FETCH=0 disables bulk (PerBlock)
+    // - WALLETCORE_BULK_FETCH=1 enables bulk and uses WALLETCORE_BULK_MODE (or default)
+    let bulk_enabled = std::env::var("WALLETCORE_BULK_FETCH")
         .ok()
         .map(|s| s != "0")
         .unwrap_or(true);
 
-    if enabled {
-        BulkFetchMode::BinByHeight
-    } else {
-        BulkFetchMode::PerBlock
+    if !bulk_enabled {
+        return BulkFetchMode::PerBlock;
+    }
+
+    match std::env::var("WALLETCORE_BULK_MODE")
+        .ok()
+        .unwrap_or_else(|| "wallet2".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" => BulkFetchMode::PerBlock,
+        "range" | "get_blocks" | "get_blocks.bin" => BulkFetchMode::RangeBlocks,
+        "wallet2" | "getblocks" | "getblocks.bin" => BulkFetchMode::Wallet2FastBlocks,
+        _ => BulkFetchMode::Wallet2FastBlocks,
     }
 }
 
@@ -87,6 +105,11 @@ use zmq;
 
 const DEFAULT_LOCK_WINDOW: u64 = 10;
 const COINBASE_LOCK_WINDOW: u64 = 60;
+
+// Bounded number of recent block hashes to keep in the wallet cache (wallet2-style chain history).
+// 4096 hashes = 4096 * 32 bytes ~= 128 KiB raw, small enough for iOS while still providing
+// a good short-chain-history window.
+const RECENT_BLOCK_HASHES_MAX: usize = 4096;
 
 static LAST_ERROR_MESSAGE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
@@ -295,6 +318,165 @@ fn update_scan_progress(
             }
         }
     }
+}
+
+// -------------------------
+// Wallet2-style chain history helpers
+// -------------------------
+
+#[inline]
+fn maybe_init_recent_hash_window(state: &mut StoredWallet) {
+    // If this wallet was loaded from an older cache blob (serde default), start_height may be 0.
+    // Initialize it defensively to restore_height so height math stays sane.
+    if state.recent_block_hashes_start_height == 0 {
+        state.recent_block_hashes_start_height = state.restore_height;
+    }
+}
+
+#[inline]
+fn recent_hashes_len(state: &StoredWallet) -> usize {
+    state.recent_block_hashes.len()
+}
+
+#[inline]
+fn recent_hash_height_range(state: &StoredWallet) -> Option<(u64, u64)> {
+    if state.recent_block_hashes.is_empty() {
+        None
+    } else {
+        let start = state.recent_block_hashes_start_height;
+        let end_inclusive =
+            start.saturating_add(state.recent_block_hashes.len().saturating_sub(1) as u64);
+        Some((start, end_inclusive))
+    }
+}
+
+/// Push a block hash into the bounded recent hash window.
+///
+/// Invariants:
+/// - We only append hashes in increasing-height order.
+/// - If a reorg or gap is detected, we reset the window to start at `height` with a single hash.
+/// - The window is bounded to `RECENT_BLOCK_HASHES_MAX` by dropping from the front.
+fn push_recent_block_hash(state: &mut StoredWallet, height: u64, hash: [u8; 32]) {
+    maybe_init_recent_hash_window(state);
+
+    if state.recent_block_hashes.is_empty() {
+        state.recent_block_hashes_start_height = height;
+        state.recent_block_hashes.push(hash);
+        return;
+    }
+
+    let start = state.recent_block_hashes_start_height;
+    let expected_next_height = start.saturating_add(state.recent_block_hashes.len() as u64);
+
+    if height == expected_next_height {
+        state.recent_block_hashes.push(hash);
+    } else if height < expected_next_height {
+        // Possible reorg or duplicate update. If it overlaps our window, truncate to that height.
+        if height >= start {
+            let idx = (height - start) as usize;
+            if idx < state.recent_block_hashes.len() {
+                state.recent_block_hashes.truncate(idx);
+                state.recent_block_hashes.push(hash);
+            } else {
+                // Shouldn't happen, but reset defensively.
+                state.recent_block_hashes_start_height = height;
+                state.recent_block_hashes.clear();
+                state.recent_block_hashes.push(hash);
+            }
+        } else {
+            // Height is before our window; reset to avoid inconsistent state.
+            state.recent_block_hashes_start_height = height;
+            state.recent_block_hashes.clear();
+            state.recent_block_hashes.push(hash);
+        }
+    } else {
+        // Gap detected; reset window to this height.
+        state.recent_block_hashes_start_height = height;
+        state.recent_block_hashes.clear();
+        state.recent_block_hashes.push(hash);
+    }
+
+    // Enforce bounded window size
+    if state.recent_block_hashes.len() > RECENT_BLOCK_HASHES_MAX {
+        let overflow = state.recent_block_hashes.len() - RECENT_BLOCK_HASHES_MAX;
+        state.recent_block_hashes.drain(0..overflow);
+        state.recent_block_hashes_start_height = state
+            .recent_block_hashes_start_height
+            .saturating_add(overflow as u64);
+    }
+}
+
+/// Get a hash from the recent hash window by height (if present).
+fn get_recent_block_hash(state: &StoredWallet, height: u64) -> Option<[u8; 32]> {
+    let start = state.recent_block_hashes_start_height;
+    if height < start {
+        return None;
+    }
+    let idx = (height - start) as usize;
+    state.recent_block_hashes.get(idx).copied()
+}
+
+/// Build a wallet2-style short chain history (`block_ids`) from the bounded recent hash window.
+///
+/// Wallet2 logic (conceptual):
+/// - Take up to 10 recent sequential hashes
+/// - Then take hashes at exponentially increasing distances (2,4,8,16,...) back
+/// - Always include genesis (if available)
+///
+/// This list is used in `/getblocks.bin` requests to allow the daemon to handle reorgs.
+fn build_short_chain_history(state: &StoredWallet) -> Vec<[u8; 32]> {
+    let (start, end) = match recent_hash_height_range(state) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    let mut ids: Vec<[u8; 32]> = Vec::new();
+
+    // Add up to 10 recent sequential hashes, newest-first.
+    let mut h = end;
+    for _ in 0..10 {
+        if let Some(hash) = get_recent_block_hash(state, h) {
+            ids.push(hash);
+        }
+        if h == 0 || h <= start {
+            break;
+        }
+        h = h.saturating_sub(1);
+    }
+
+    // Exponential backoff from end height.
+    let mut offset: u64 = 2;
+    loop {
+        // stop if we'd underflow past start
+        if end < offset {
+            break;
+        }
+        let target_h = end.saturating_sub(offset);
+        if target_h < start {
+            break;
+        }
+        if let Some(hash) = get_recent_block_hash(state, target_h) {
+            ids.push(hash);
+        }
+        // cap offset growth to avoid overflow
+        if offset > (u64::MAX / 2) {
+            break;
+        }
+        offset *= 2;
+    }
+
+    // Always include genesis if present in our window.
+    if start == 0 {
+        if let Some(genesis) = state.recent_block_hashes.first().copied() {
+            ids.push(genesis);
+        }
+    }
+
+    // De-dup while preserving order (newest-first).
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    ids.retain(|h| seen.insert(*h));
+
+    ids
 }
 
 #[no_mangle]
@@ -601,6 +783,271 @@ struct BlockingRpcTransport {
     agent: Arc<ureq::Agent>,
     base_url: String,
     auth_header: Option<String>,
+}
+
+///
+/// Wallet2-style `COMMAND_RPC_GET_BLOCKS_FAST` (`/get_blocks.bin`) request/response models.
+///
+/// This endpoint is what `wallet2`/Feather use for fast wallet sync: it returns both:
+/// - `blocks` (block blobs + pruned tx blobs)
+/// - `output_indices` (per-transaction output indices), eliminating the need for `/get_o_indexes.bin`
+///
+/// We implement only the subset we need for scanning.
+///
+/// NOTE: Monerod supports both `/get_blocks.bin` and `/getblocks.bin`.
+/// We call `/getblocks.bin` to avoid colliding with the other (range-based) `get_blocks.bin` request
+/// shape used elsewhere.
+///
+
+#[derive(Clone, Debug)]
+struct GetBlocksFastBinRequest {
+    block_ids: Vec<[u8; 32]>,
+    start_height: u64,
+    prune: bool,
+}
+
+#[derive(Default)]
+struct GetBlocksFastBinRequestBuilder {
+    block_ids: Option<Vec<[u8; 32]>>,
+    start_height: Option<u64>,
+    prune: Option<bool>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
+    for GetBlocksFastBinRequestBuilder
+{
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "block_ids" => {
+                self.block_ids = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "start_height" => {
+                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "prune" => {
+                self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<GetBlocksFastBinRequest> {
+        Ok(GetBlocksFastBinRequest {
+            block_ids: self.block_ids.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field block_ids missing")
+            })?,
+            start_height: self.start_height.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field start_height missing")
+            })?,
+            prune: self.prune.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("Required field prune missing")
+            })?,
+        })
+    }
+}
+
+impl EpeeObject for GetBlocksFastBinRequest {
+    type Builder = GetBlocksFastBinRequestBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        3
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.block_ids, "block_ids", w)?;
+        write_field(self.start_height, "start_height", w)?;
+        write_field(self.prune, "prune", w)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TxOutputIndices {
+    indices: Vec<u64>,
+}
+
+#[derive(Default)]
+struct TxOutputIndicesBuilder {
+    indices: Option<Vec<u64>>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<TxOutputIndices> for TxOutputIndicesBuilder {
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "indices" => {
+                self.indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<TxOutputIndices> {
+        Ok(TxOutputIndices {
+            indices: self.indices.unwrap_or_default(),
+        })
+    }
+}
+
+impl EpeeObject for TxOutputIndices {
+    type Builder = TxOutputIndicesBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        1
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.indices, "indices", w)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BlockOutputIndices {
+    indices: Vec<TxOutputIndices>,
+}
+
+#[derive(Default)]
+struct BlockOutputIndicesBuilder {
+    indices: Option<Vec<TxOutputIndices>>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<BlockOutputIndices> for BlockOutputIndicesBuilder {
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "indices" => {
+                self.indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<BlockOutputIndices> {
+        Ok(BlockOutputIndices {
+            indices: self.indices.unwrap_or_default(),
+        })
+    }
+}
+
+impl EpeeObject for BlockOutputIndices {
+    type Builder = BlockOutputIndicesBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        1
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.indices, "indices", w)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GetBlocksFastBinResponse {
+    blocks: Vec<BlockCompleteEntry>,
+    output_indices: Vec<BlockOutputIndices>,
+    start_height: Option<u64>,
+    current_height: Option<u64>,
+    status: Option<String>,
+    untrusted: Option<bool>,
+}
+
+#[derive(Default)]
+struct GetBlocksFastBinResponseBuilder {
+    blocks: Option<Vec<BlockCompleteEntry>>,
+    output_indices: Option<Vec<BlockOutputIndices>>,
+    start_height: Option<u64>,
+    current_height: Option<u64>,
+    status: Option<String>,
+    untrusted: Option<bool>,
+}
+
+impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
+    for GetBlocksFastBinResponseBuilder
+{
+    fn add_field<B: Buf>(
+        &mut self,
+        name: &str,
+        r: &mut B,
+    ) -> cuprate_epee_encoding::error::Result<bool> {
+        match name {
+            "blocks" => {
+                self.blocks = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "output_indices" => {
+                self.output_indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "start_height" => {
+                self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "current_height" => {
+                self.current_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "status" => {
+                self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "untrusted" => {
+                self.untrusted = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn finish(self) -> cuprate_epee_encoding::error::Result<GetBlocksFastBinResponse> {
+        Ok(GetBlocksFastBinResponse {
+            blocks: self.blocks.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("response missing 'blocks'")
+            })?,
+            output_indices: self.output_indices.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("response missing 'output_indices'")
+            })?,
+            start_height: self.start_height,
+            current_height: self.current_height,
+            status: self.status,
+            untrusted: self.untrusted,
+        })
+    }
+}
+
+impl EpeeObject for GetBlocksFastBinResponse {
+    type Builder = GetBlocksFastBinResponseBuilder;
+
+    fn number_of_fields(&self) -> u64 {
+        6
+    }
+
+    fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.blocks, "blocks", w)?;
+        write_field(self.output_indices, "output_indices", w)?;
+        if let Some(start_height) = self.start_height {
+            write_field(start_height, "start_height", w)?;
+        }
+        if let Some(current_height) = self.current_height {
+            write_field(current_height, "current_height", w)?;
+        }
+        if let Some(status) = self.status {
+            write_field(status, "status", w)?;
+        }
+        if let Some(untrusted) = self.untrusted {
+            write_field(untrusted, "untrusted", w)?;
+        }
+        Ok(())
+    }
 }
 
 /// Request for monerod `/get_blocks_by_height.bin` (portable_storage / EPEE encoded).
@@ -1095,6 +1542,29 @@ impl BlockingRpcTransport {
         Ok(resp)
     }
 
+    fn get_blocks_fast_bin(
+        &self,
+        block_ids: Vec<[u8; 32]>,
+        start_height: u64,
+        prune: bool,
+    ) -> Result<GetBlocksFastBinResponse, RpcError> {
+        let req = GetBlocksFastBinRequest {
+            block_ids,
+            start_height,
+            prune,
+        };
+        let body = to_bytes(req)
+            .map(|b| b.to_vec())
+            .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+        // Wallet2-style endpoint (non-underscored variant) to avoid colliding with the range-based
+        // `/get_blocks.bin` request shape (start_height/count/prune).
+        let resp_bytes = self.post_bin("getblocks.bin", body)?;
+        let mut reader: &[u8] = resp_bytes.as_slice();
+        let resp: GetBlocksFastBinResponse = from_bytes(&mut reader)
+            .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
+        Ok(resp)
+    }
+
     fn json_rpc_call(
         &self,
         method: &str,
@@ -1133,6 +1603,53 @@ impl BlockingRpcTransport {
             ));
         }
         Ok(value)
+    }
+
+    /// Fetch a block hash by height via JSON-RPC `on_get_block_hash`.
+    ///
+    /// Monero expects params as a positional array: `[height]`.
+    /// Returns the 32-byte block hash.
+    fn get_block_hash_by_height_json(&self, height: u64) -> Result<[u8; 32], (c_int, String)> {
+        let height_i64 = i64::try_from(height).map_err(|_| {
+            (
+                -16,
+                format!("get_block_hash_by_height_json: height overflow: {height}"),
+            )
+        })?;
+
+        let value = self.json_rpc_call("on_get_block_hash", serde_json::json!([height_i64]))?;
+
+        let result = value
+            .get("result")
+            .ok_or_else(|| (-15, "on_get_block_hash response missing result".to_string()))?;
+
+        let hash_hex = result
+            .as_str()
+            .ok_or_else(|| (-15, "on_get_block_hash result was not a string".to_string()))?;
+
+        // Expect 64 hex chars (32 bytes)
+        if hash_hex.len() != 64 {
+            return Err((
+                -15,
+                format!(
+                    "on_get_block_hash returned unexpected hash length {} (expected 64)",
+                    hash_hex.len()
+                ),
+            ));
+        }
+
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let byte_str = &hash_hex[i * 2..i * 2 + 2];
+            out[i] = u8::from_str_radix(byte_str, 16).map_err(|e| {
+                (
+                    -15,
+                    format!("on_get_block_hash returned invalid hex at byte {i}: {e}"),
+                )
+            })?;
+        }
+
+        Ok(out)
     }
 }
 
@@ -1595,6 +2112,14 @@ struct StoredWallet {
     seen_outpoints: HashSet<([u8; 32], u64)>,
     pending_outgoing: Vec<PendingOutgoingTx>,
     tx_ledger: HashMap<String, LedgerEntry>,
+
+    // Wallet2-style bounded recent block-hash history used to build `block_ids` (short chain history)
+    // for `/getblocks.bin` fast sync. This is intentionally bounded to keep cache size small.
+    //
+    // - `recent_block_hashes_start_height` is the height of the first hash in `recent_block_hashes`.
+    // - `recent_block_hashes[i]` corresponds to height `recent_block_hashes_start_height + i`.
+    recent_block_hashes_start_height: u64,
+    recent_block_hashes: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1637,6 +2162,14 @@ struct PersistedWallet {
     seen_outpoints: Vec<([u8; 32], u64)>,
     pending_outgoing: Vec<PendingOutgoingTx>,
     tx_ledger: HashMap<String, LedgerEntry>,
+
+    // Bounded recent block-hash history (see `StoredWallet` for details).
+    // Marked `serde(default)` so older cache blobs (which don't have these fields yet)
+    // can still be deserialized safely.
+    #[serde(default)]
+    recent_block_hashes_start_height: u64,
+    #[serde(default)]
+    recent_block_hashes: Vec<[u8; 32]>,
 }
 
 impl From<&Timelock> for PersistedTimelock {
@@ -1731,6 +2264,9 @@ impl From<&StoredWallet> for PersistedWallet {
             seen_outpoints: wallet.seen_outpoints.iter().copied().collect(),
             pending_outgoing: wallet.pending_outgoing.clone(),
             tx_ledger: wallet.tx_ledger.clone(),
+
+            recent_block_hashes_start_height: wallet.recent_block_hashes_start_height,
+            recent_block_hashes: wallet.recent_block_hashes.clone(),
         }
     }
 }
@@ -1751,6 +2287,10 @@ impl PersistedWallet {
         state.seen_outpoints = self.seen_outpoints.into_iter().collect();
         state.pending_outgoing = self.pending_outgoing;
         state.tx_ledger = self.tx_ledger;
+
+        // Bounded recent block-hash history (wallet2-style chain history).
+        state.recent_block_hashes_start_height = self.recent_block_hashes_start_height;
+        state.recent_block_hashes = self.recent_block_hashes;
 
         // Defensive: older caches or older runtime state may not have initialized the ledger.
         // Ensure it exists so transfer history can be built deterministically.
@@ -1938,6 +2478,10 @@ pub extern "C" fn wallet_open_from_mnemonic(
                 seen_outpoints: HashSet::<([u8; 32], u64)>::new(),
                 pending_outgoing: Vec::new(),
                 tx_ledger: HashMap::new(),
+
+                // Start empty; will be populated during refresh.
+                recent_block_hashes_start_height: restore_height,
+                recent_block_hashes: Vec::new(),
             });
         }
     }
@@ -2194,10 +2738,15 @@ pub extern "C" fn wallet_refresh(
                     std::sync::mpsc::channel::<Result<Vec<TrackedOutput>, (c_int, String)>>();
 
                 // One-time enable log
-                if effective_bulk_fetch == BulkFetchMode::BinByHeight && !bulk_fetch_logged {
+                if effective_bulk_fetch != BulkFetchMode::PerBlock && !bulk_fetch_logged {
+                    let mode_str = match effective_bulk_fetch {
+                        BulkFetchMode::Wallet2FastBlocks => "getblocks(wallet2)",
+                        BulkFetchMode::RangeBlocks => "get_blocks(range)",
+                        BulkFetchMode::PerBlock => "per_block",
+                    };
                     print!(
-                        "🧱 bulk-fetch(bin:get_blocks)=on batch={} clearnet={}\n",
-                        bulk_fetch_batch, clearnet_scan
+                        "🧱 bulk-fetch(bin:{})=on batch={} clearnet={}\n",
+                        mode_str, bulk_fetch_batch, clearnet_scan
                     );
                     bulk_fetch_logged = true;
                 }
@@ -2239,14 +2788,280 @@ pub extern "C" fn wallet_refresh(
                             let mut collected: Vec<TrackedOutput> = Vec::new();
 
                             match worker_effective_bulk_fetch {
-                                BulkFetchMode::BinByHeight => {
+                                BulkFetchMode::Wallet2FastBlocks => {
                                     let count = end_h_exclusive.saturating_sub(start_h);
                                     if count == 0 {
                                         let _ = txc.send(Ok(collected));
                                         return;
                                     }
 
-                                    // Fetch contiguous range via get_blocks.bin (prune=false)
+                                    // Build short chain history (block_ids) from the persisted bounded hash window.
+                                    // If the cache is empty, fall back to range mode.
+                                    let block_ids = {
+                                        let mut ids: Vec<[u8; 32]> = Vec::new();
+                                        if let Ok(map) = WALLET_STORE.lock() {
+                                            if let Some(state) = map.get(&id_owned_for_worker) {
+                                                ids = build_short_chain_history(state);
+                                            }
+                                        }
+                                        ids
+                                    };
+
+                                    if block_ids.is_empty() {
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            "wallet_refresh: wallet2 bulk mode has no chain history yet (block_ids empty)".to_string(),
+                                        )));
+                                        return;
+                                    }
+
+                                    // Call wallet2-style getblocks.bin (blocks + output_indices).
+                                    let resp = match client
+                                        .get_blocks_fast_bin(block_ids, start_h, true)
+                                    {
+                                        Ok(r) => r,
+                                        Err(err) => {
+                                            let _ = txc.send(Err((
+                                                -16,
+                                                format!(
+                                                    "wallet_refresh: bulk getblocks.bin failed at heights {}..{}: {}",
+                                                    start_h,
+                                                    end_h_exclusive.saturating_sub(1),
+                                                    err
+                                                ),
+                                            )));
+                                            return;
+                                        }
+                                    };
+
+                                    if resp.blocks.is_empty() {
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            format!(
+                                                "wallet_refresh: bulk getblocks.bin returned 0 blocks for heights {}..{}",
+                                                start_h,
+                                                end_h_exclusive.saturating_sub(1)
+                                            ),
+                                        )));
+                                        return;
+                                    }
+
+                                    if resp.blocks.len() != resp.output_indices.len() {
+                                        let _ = txc.send(Err((
+                                            -16,
+                                            format!(
+                                                "wallet_refresh: getblocks.bin mismatched blocks ({}) and output_indices ({}) sizes",
+                                                resp.blocks.len(),
+                                                resp.output_indices.len()
+                                            ),
+                                        )));
+                                        return;
+                                    }
+
+                                    // Scan each returned block entry in order. We assign heights sequentially starting from start_h.
+                                    let mut th = start_h;
+                                    for (entry, boi) in
+                                        resp.blocks.into_iter().zip(resp.output_indices.into_iter())
+                                    {
+                                        if refresh_cancelled_for_wallet(&id_owned_for_worker) {
+                                            let _ = txc.send(Err((
+                                                -30,
+                                                "wallet_refresh: cancelled".to_string(),
+                                            )));
+                                            return;
+                                        }
+
+                                        // If tx blobs are missing for this entry, fall back to per-block for just that height.
+                                        if entry.txs.is_empty() {
+                                            let block_number = match usize::try_from(th) {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        "wallet_refresh: block number conversion overflow"
+                                                            .to_string(),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            let scannable = match block_on(
+                                                client.get_scannable_block_by_number(block_number),
+                                            ) {
+                                                Ok(block) => block,
+                                                Err(err) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        format!(
+                                                            "wallet_refresh: per-block fallback RPC block fetch failed at height {}: {}",
+                                                            th, err
+                                                        ),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            // Record hash
+                                            {
+                                                let block_hash = scannable.block.hash();
+                                                if let Ok(mut map) = WALLET_STORE.lock() {
+                                                    if let Some(state) =
+                                                        map.get_mut(&id_owned_for_worker)
+                                                    {
+                                                        push_recent_block_hash(
+                                                            state, th, block_hash,
+                                                        );
+                                                    }
+                                                }
+                                            }
+
+                                            let miner_hash =
+                                                scannable.block.miner_transaction().hash();
+                                            let outputs = match local_scanner.scan(scannable) {
+                                                Ok(result) => result.ignore_additional_timelock(),
+                                                Err(_) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        format!("wallet_refresh: scanner failed at height {}", th),
+                                                    )));
+                                                    return;
+                                                }
+                                            };
+
+                                            for output in outputs {
+                                                let (major, minor) = output
+                                                    .subaddress()
+                                                    .map(|idx| (idx.account(), idx.address()))
+                                                    .unwrap_or((0, 0));
+                                                collected.push(TrackedOutput {
+                                                    tx_hash: output.transaction(),
+                                                    index_in_tx: output.index_in_transaction(),
+                                                    amount: output.commitment().amount,
+                                                    block_height: th,
+                                                    additional_timelock: output
+                                                        .additional_timelock(),
+                                                    is_coinbase: output.transaction() == miner_hash,
+                                                    subaddress_major: major,
+                                                    subaddress_minor: minor,
+                                                    spent: false,
+                                                });
+                                            }
+
+                                            th = th.saturating_add(1);
+                                            continue;
+                                        }
+
+                                        // Parse block blob
+                                        let mut bb = entry.block.as_slice();
+                                        let parsed_block = match Block::read(&mut bb) {
+                                            Ok(b) => b,
+                                            Err(_) => {
+                                                let _ = txc.send(Err((
+                                                    -16,
+                                                    format!(
+                                                        "wallet_refresh: block parse failed at height {}",
+                                                        th
+                                                    ),
+                                                )));
+                                                return;
+                                            }
+                                        };
+
+                                        // Parse tx blobs (pruned)
+                                        let mut parsed_txs: Vec<Transaction<Pruned>> =
+                                            Vec::with_capacity(entry.txs.len());
+                                        for tx_blob in entry.txs {
+                                            let mut tb = tx_blob.as_slice();
+                                            match Transaction::<Pruned>::read(&mut tb) {
+                                                Ok(t) => parsed_txs.push(t),
+                                                Err(_) => {
+                                                    let _ = txc.send(Err((
+                                                        -16,
+                                                        format!(
+                                                            "wallet_refresh: tx parse failed at height {}",
+                                                            th
+                                                        ),
+                                                    )));
+                                                    return;
+                                                }
+                                            }
+                                        }
+
+                                        // Record hash from the parsed block (works without extra RPC)
+                                        {
+                                            let block_hash = parsed_block.hash();
+                                            if let Ok(mut map) = WALLET_STORE.lock() {
+                                                if let Some(state) =
+                                                    map.get_mut(&id_owned_for_worker)
+                                                {
+                                                    push_recent_block_hash(state, th, block_hash);
+                                                }
+                                            }
+                                        }
+
+                                        // Compute output_index_for_first_ringct_output from output_indices (wallet2-style),
+                                        // avoiding get_o_indexes.bin.
+                                        let mut output_index_for_first_ringct_output: Option<u64> =
+                                            None;
+                                        for txoi in boi.indices.iter() {
+                                            if let Some(first) = txoi.indices.first() {
+                                                output_index_for_first_ringct_output = Some(*first);
+                                                break;
+                                            }
+                                        }
+
+                                        let scannable = ScannableBlock {
+                                            block: parsed_block,
+                                            transactions: parsed_txs,
+                                            output_index_for_first_ringct_output,
+                                        };
+
+                                        let miner_hash = scannable.block.miner_transaction().hash();
+                                        let outputs = match local_scanner.scan(scannable) {
+                                            Ok(result) => result.ignore_additional_timelock(),
+                                            Err(_) => {
+                                                let _ = txc.send(Err((
+                                                    -16,
+                                                    format!(
+                                                        "wallet_refresh: scanner failed at height {}",
+                                                        th
+                                                    ),
+                                                )));
+                                                return;
+                                            }
+                                        };
+
+                                        for output in outputs {
+                                            let (major, minor) = output
+                                                .subaddress()
+                                                .map(|idx| (idx.account(), idx.address()))
+                                                .unwrap_or((0, 0));
+                                            collected.push(TrackedOutput {
+                                                tx_hash: output.transaction(),
+                                                index_in_tx: output.index_in_transaction(),
+                                                amount: output.commitment().amount,
+                                                block_height: th,
+                                                additional_timelock: output.additional_timelock(),
+                                                is_coinbase: output.transaction() == miner_hash,
+                                                subaddress_major: major,
+                                                subaddress_minor: minor,
+                                                spent: false,
+                                            });
+                                        }
+
+                                        th = th.saturating_add(1);
+                                    }
+
+                                    let _ = txc.send(Ok(collected));
+                                }
+
+                                BulkFetchMode::RangeBlocks => {
+                                    let count = end_h_exclusive.saturating_sub(start_h);
+                                    if count == 0 {
+                                        let _ = txc.send(Ok(collected));
+                                        return;
+                                    }
+
                                     let resp = match client.get_blocks_bin(start_h, count, false) {
                                         Ok(r) => r,
                                         Err(err) => {
@@ -2263,8 +3078,6 @@ pub extern "C" fn wallet_refresh(
                                         }
                                     };
 
-                                    // Some daemons may omit tx blobs for some entries even when prune=false.
-                                    // Don't fail the whole span; we'll do per-height per-block fallback where needed.
                                     if resp.blocks.is_empty() {
                                         let _ = txc.send(Err((
                                             -16,
@@ -2277,12 +3090,6 @@ pub extern "C" fn wallet_refresh(
                                         return;
                                     }
 
-                                    // Scan each returned block entry in order. We assign heights sequentially
-                                    // starting from start_h (daemon returns contiguous range).
-                                    //
-                                    // Some daemons may omit tx blobs for some entries even when prune=false.
-                                    // When that happens, fall back to the existing per-block scan for just that height
-                                    // instead of failing the whole span.
                                     let mut th = start_h;
                                     for entry in resp.blocks {
                                         if refresh_cancelled_for_wallet(&id_owned_for_worker) {
@@ -2321,6 +3128,21 @@ pub extern "C" fn wallet_refresh(
                                                     return;
                                                 }
                                             };
+
+                                            // Record block hash into wallet2-style recent hash history
+                                            // (used to build short chain history for `/getblocks.bin`).
+                                            {
+                                                let block_hash = scannable.block.hash();
+                                                if let Ok(mut map) = WALLET_STORE.lock() {
+                                                    if let Some(state) =
+                                                        map.get_mut(&id_owned_for_worker)
+                                                    {
+                                                        push_recent_block_hash(
+                                                            state, th, block_hash,
+                                                        );
+                                                    }
+                                                }
+                                            }
 
                                             let miner_hash =
                                                 scannable.block.miner_transaction().hash();
@@ -2395,7 +3217,6 @@ pub extern "C" fn wallet_refresh(
                                             }
                                         }
 
-                                        // Compute output_index_for_first_ringct_output similarly to monero-oxide rpc:
                                         let mut output_index_for_first_ringct_output: Option<u64> =
                                             None;
                                         let miner_tx_hash = parsed_block.miner_transaction().hash();
@@ -2586,11 +3407,11 @@ pub extern "C" fn wallet_refresh(
                             Ok(Err((code, msg))) => {
                                 // If bulk fetch failed inside a worker, log once and fall back to per-block
                                 // on the next outer iterations (best-effort).
-                                if effective_bulk_fetch == BulkFetchMode::BinByHeight
+                                if effective_bulk_fetch != BulkFetchMode::PerBlock
                                     && !bulk_fetch_fallback_logged
                                 {
                                     print!(
-                                        "🧱 bulk-fetch(bin:get_blocks) failed; falling back to per-block: {}\n",
+                                        "🧱 bulk-fetch(bin) failed; falling back to per-block: {}\n",
                                         msg
                                     );
                                     bulk_fetch_fallback_logged = true;
@@ -2669,11 +3490,16 @@ pub extern "C" fn wallet_refresh(
                 }
 
                 match effective_bulk_fetch {
-                    BulkFetchMode::BinByHeight => {
+                    BulkFetchMode::Wallet2FastBlocks | BulkFetchMode::RangeBlocks => {
                         if !bulk_fetch_logged {
+                            let mode_str = match effective_bulk_fetch {
+                                BulkFetchMode::Wallet2FastBlocks => "getblocks(wallet2)",
+                                BulkFetchMode::RangeBlocks => "get_blocks(range)",
+                                BulkFetchMode::PerBlock => "per_block",
+                            };
                             print!(
-                                "🧱 bulk-fetch(bin:get_blocks)=on batch={} clearnet={}\n",
-                                bulk_fetch_batch, clearnet_scan
+                                "🧱 bulk-fetch(bin:{})=on batch={} clearnet={}\n",
+                                mode_str, bulk_fetch_batch, clearnet_scan
                             );
                             bulk_fetch_logged = true;
                         }
@@ -2810,6 +3636,17 @@ pub extern "C" fn wallet_refresh(
                                         break;
                                     }
                                 };
+
+                                // Record block hash into wallet2-style recent hash history
+                                // (used to build short chain history for `/getblocks.bin`).
+                                {
+                                    let block_hash = scannable.block.hash();
+                                    if let Ok(mut map) = WALLET_STORE.lock() {
+                                        if let Some(state) = map.get_mut(id) {
+                                            push_recent_block_hash(state, th, block_hash);
+                                        }
+                                    }
+                                }
 
                                 let miner_hash = scannable.block.miner_transaction().hash();
                                 let outputs = match scanner.scan(scannable) {
