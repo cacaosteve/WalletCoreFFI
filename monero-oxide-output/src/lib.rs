@@ -801,16 +801,26 @@ struct BlockingRpcTransport {
 
 #[derive(Clone, Debug)]
 struct GetBlocksFastBinRequest {
+    // COMMAND_RPC_GET_BLOCKS_FAST::request_t fields
+    // See monero/src/rpc/core_rpc_server_commands_defs.h (KV_SERIALIZE_* map)
+    requested_info: u8,
     block_ids: Vec<[u8; 32]>,
     start_height: u64,
     prune: bool,
+    no_miner_tx: bool,
+    pool_info_since: u64,
+    max_block_count: u64,
 }
 
 #[derive(Default)]
 struct GetBlocksFastBinRequestBuilder {
+    requested_info: Option<u8>,
     block_ids: Option<Vec<[u8; 32]>>,
     start_height: Option<u64>,
     prune: Option<bool>,
+    no_miner_tx: Option<bool>,
+    pool_info_since: Option<u64>,
+    max_block_count: Option<u64>,
 }
 
 impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
@@ -822,6 +832,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
         r: &mut B,
     ) -> cuprate_epee_encoding::error::Result<bool> {
         match name {
+            "requested_info" => {
+                self.requested_info = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
             "block_ids" => {
                 self.block_ids = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
@@ -831,6 +844,15 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
             "prune" => {
                 self.prune = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
+            "no_miner_tx" => {
+                self.no_miner_tx = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "pool_info_since" => {
+                self.pool_info_since = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "max_block_count" => {
+                self.max_block_count = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -838,6 +860,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
 
     fn finish(self) -> cuprate_epee_encoding::error::Result<GetBlocksFastBinRequest> {
         Ok(GetBlocksFastBinRequest {
+            requested_info: self.requested_info.unwrap_or(0),
             block_ids: self.block_ids.ok_or_else(|| {
                 cuprate_epee_encoding::error::Error::Format("Required field block_ids missing")
             })?,
@@ -847,6 +870,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
             prune: self.prune.ok_or_else(|| {
                 cuprate_epee_encoding::error::Error::Format("Required field prune missing")
             })?,
+            no_miner_tx: self.no_miner_tx.unwrap_or(false),
+            pool_info_since: self.pool_info_since.unwrap_or(0),
+            max_block_count: self.max_block_count.unwrap_or(0),
         })
     }
 }
@@ -855,13 +881,17 @@ impl EpeeObject for GetBlocksFastBinRequest {
     type Builder = GetBlocksFastBinRequestBuilder;
 
     fn number_of_fields(&self) -> u64 {
-        3
+        7
     }
 
     fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+        write_field(self.requested_info, "requested_info", w)?;
         write_field(self.block_ids, "block_ids", w)?;
         write_field(self.start_height, "start_height", w)?;
         write_field(self.prune, "prune", w)?;
+        write_field(self.no_miner_tx, "no_miner_tx", w)?;
+        write_field(self.pool_info_since, "pool_info_since", w)?;
+        write_field(self.max_block_count, "max_block_count", w)?;
         Ok(())
     }
 }
@@ -958,10 +988,14 @@ impl EpeeObject for BlockOutputIndices {
 
 #[derive(Clone, Debug)]
 struct GetBlocksFastBinResponse {
+    // Required fields per COMMAND_RPC_GET_BLOCKS_FAST::response_t
     blocks: Vec<BlockCompleteEntry>,
+    start_height: u64,
+    current_height: u64,
     output_indices: Vec<BlockOutputIndices>,
-    start_height: Option<u64>,
-    current_height: Option<u64>,
+    // Optional fields (we ignore pool info for wallet sync)
+    daemon_time: Option<u64>,
+    pool_info_extent: Option<u8>,
     status: Option<String>,
     untrusted: Option<bool>,
 }
@@ -969,9 +1003,11 @@ struct GetBlocksFastBinResponse {
 #[derive(Default)]
 struct GetBlocksFastBinResponseBuilder {
     blocks: Option<Vec<BlockCompleteEntry>>,
-    output_indices: Option<Vec<BlockOutputIndices>>,
     start_height: Option<u64>,
     current_height: Option<u64>,
+    output_indices: Option<Vec<BlockOutputIndices>>,
+    daemon_time: Option<u64>,
+    pool_info_extent: Option<u8>,
     status: Option<String>,
     untrusted: Option<bool>,
 }
@@ -988,14 +1024,20 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
             "blocks" => {
                 self.blocks = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
-            "output_indices" => {
-                self.output_indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
-            }
             "start_height" => {
                 self.start_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
             "current_height" => {
                 self.current_height = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "output_indices" => {
+                self.output_indices = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "daemon_time" => {
+                self.daemon_time = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+            "pool_info_extent" => {
+                self.pool_info_extent = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
             "status" => {
                 self.status = Some(cuprate_epee_encoding::read_epee_value(r)?);
@@ -1013,11 +1055,17 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
             blocks: self.blocks.ok_or_else(|| {
                 cuprate_epee_encoding::error::Error::Format("response missing 'blocks'")
             })?,
+            start_height: self.start_height.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("response missing 'start_height'")
+            })?,
+            current_height: self.current_height.ok_or_else(|| {
+                cuprate_epee_encoding::error::Error::Format("response missing 'current_height'")
+            })?,
             output_indices: self.output_indices.ok_or_else(|| {
                 cuprate_epee_encoding::error::Error::Format("response missing 'output_indices'")
             })?,
-            start_height: self.start_height,
-            current_height: self.current_height,
+            daemon_time: self.daemon_time,
+            pool_info_extent: self.pool_info_extent,
             status: self.status,
             untrusted: self.untrusted,
         })
@@ -1028,17 +1076,19 @@ impl EpeeObject for GetBlocksFastBinResponse {
     type Builder = GetBlocksFastBinResponseBuilder;
 
     fn number_of_fields(&self) -> u64 {
-        6
+        8
     }
 
     fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
         write_field(self.blocks, "blocks", w)?;
+        write_field(self.start_height, "start_height", w)?;
+        write_field(self.current_height, "current_height", w)?;
         write_field(self.output_indices, "output_indices", w)?;
-        if let Some(start_height) = self.start_height {
-            write_field(start_height, "start_height", w)?;
+        if let Some(daemon_time) = self.daemon_time {
+            write_field(daemon_time, "daemon_time", w)?;
         }
-        if let Some(current_height) = self.current_height {
-            write_field(current_height, "current_height", w)?;
+        if let Some(pool_info_extent) = self.pool_info_extent {
+            write_field(pool_info_extent, "pool_info_extent", w)?;
         }
         if let Some(status) = self.status {
             write_field(status, "status", w)?;
@@ -1548,10 +1598,19 @@ impl BlockingRpcTransport {
         start_height: u64,
         prune: bool,
     ) -> Result<GetBlocksFastBinResponse, RpcError> {
+        // Match COMMAND_RPC_GET_BLOCKS_FAST::request_t defaults:
+        // requested_info defaults to 0 (BLOCKS_ONLY),
+        // no_miner_tx defaults to false,
+        // pool_info_since defaults to 0,
+        // max_block_count defaults to 0.
         let req = GetBlocksFastBinRequest {
+            requested_info: 0,
             block_ids,
             start_height,
             prune,
+            no_miner_tx: false,
+            pool_info_since: 0,
+            max_block_count: 0,
         };
         let body = to_bytes(req)
             .map(|b| b.to_vec())
