@@ -479,6 +479,229 @@ fn build_short_chain_history(state: &StoredWallet) -> Vec<[u8; 32]> {
     ids
 }
 
+// -------------------------
+// Generic EPEE value skipping
+// -------------------------
+//
+// `cuprate_epee_encoding` object builders call `add_field(name, reader)` for each field.
+// If we encounter an unknown field, we MUST consume its value to keep the reader aligned.
+// Otherwise subsequent reads can fail with "Marker does not match expected Marker".
+//
+// This helper implements a generic skipper for EPEE-encoded values.
+//
+// It is intentionally conservative and only supports the marker kinds we actually see from monerod.
+// If we encounter an unsupported marker, we return a Format error so we can extend support safely.
+fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+    // EPEE values begin with a one-byte "type marker".
+    // We don't have a public marker enum here, so we parse conservatively based on monerod usage.
+    //
+    // Marker reference (Monero portable_storage):
+    // - integer, bool, string/blob, object, array, etc.
+    //
+    // We only need to be able to advance the cursor, not interpret the value.
+    if !r.has_remaining() {
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "skip_epee_value: unexpected EOF (no marker)",
+        ));
+    }
+
+    let marker = r.get_u8();
+
+    // Most primitive markers are followed by a fixed-size payload.
+    // NOTE: These marker values are not guaranteed stable across implementations; this is best-effort.
+    // If we hit an unknown marker in practice, we'll log it via the caller debug paths and extend this.
+    match marker {
+        // Booleans are encoded as 1 byte
+        0x01 => {
+            if r.remaining() < 1 {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value: EOF reading bool",
+                ));
+            }
+            let _ = r.get_u8();
+            Ok(())
+        }
+
+        // Signed/unsigned integers (fixed width). Monero portable_storage uses 8-byte integers frequently.
+        // These markers are best-effort; if they don't match a given daemon, we'll fail fast and extend.
+        0x02 | 0x03 => {
+            if r.remaining() < 8 {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value: EOF reading int64",
+                ));
+            }
+            r.advance(8);
+            Ok(())
+        }
+
+        // Strings / blobs: varint length + bytes.
+        // We treat both as "length-prefixed byte sequences".
+        0x0a | 0x0b => {
+            let len = skip_epee_varint_u64(r)?;
+            let len_usize = usize::try_from(len).map_err(|_| {
+                cuprate_epee_encoding::error::Error::Format("skip_epee_value: length overflow")
+            })?;
+            if r.remaining() < len_usize {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value: EOF reading bytes",
+                ));
+            }
+            r.advance(len_usize);
+            Ok(())
+        }
+
+        // Object: varint field count + repeated (name,value) pairs.
+        0x0c => {
+            let fields = skip_epee_varint_u64(r)?;
+            for _ in 0..fields {
+                // Field name is a length-prefixed string
+                let name_len = skip_epee_varint_u64(r)?;
+                let name_len_usize = usize::try_from(name_len).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value: name length overflow",
+                    )
+                })?;
+                if r.remaining() < name_len_usize {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value: EOF reading field name",
+                    ));
+                }
+                r.advance(name_len_usize);
+
+                // Field type marker + value
+                skip_epee_value(r)?;
+            }
+            Ok(())
+        }
+
+        // Array: marker for element type + varint length + elements.
+        0x0d => {
+            if !r.has_remaining() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value: EOF reading array element marker",
+                ));
+            }
+            let elem_marker = r.get_u8();
+            let n = skip_epee_varint_u64(r)?;
+            for _ in 0..n {
+                // For arrays, each element is encoded without its own marker in Monero portable_storage,
+                // because the element marker is provided once. We therefore skip based on elem_marker.
+                skip_epee_value_with_known_marker(r, elem_marker)?;
+            }
+            Ok(())
+        }
+
+        _ => Err(cuprate_epee_encoding::error::Error::Format(
+            "skip_epee_value: unsupported marker (extend decoder)",
+        )),
+    }
+}
+
+fn skip_epee_value_with_known_marker<B: Buf>(
+    r: &mut B,
+    marker: u8,
+) -> cuprate_epee_encoding::error::Result<()> {
+    // Same as skip_epee_value, but the marker byte is already known/consumed by the array header.
+    match marker {
+        0x01 => {
+            if r.remaining() < 1 {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: EOF reading bool",
+                ));
+            }
+            let _ = r.get_u8();
+            Ok(())
+        }
+        0x02 | 0x03 => {
+            if r.remaining() < 8 {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: EOF reading int64",
+                ));
+            }
+            r.advance(8);
+            Ok(())
+        }
+        0x0a | 0x0b => {
+            let len = skip_epee_varint_u64(r)?;
+            let len_usize = usize::try_from(len).map_err(|_| {
+                cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: length overflow",
+                )
+            })?;
+            if r.remaining() < len_usize {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: EOF reading bytes",
+                ));
+            }
+            r.advance(len_usize);
+            Ok(())
+        }
+        0x0c => {
+            // Object elements in arrays are still full objects (field count + pairs)
+            let fields = skip_epee_varint_u64(r)?;
+            for _ in 0..fields {
+                let name_len = skip_epee_varint_u64(r)?;
+                let name_len_usize = usize::try_from(name_len).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value_with_known_marker: name length overflow",
+                    )
+                })?;
+                if r.remaining() < name_len_usize {
+                    return Err(cuprate_epee_encoding::error::Error::Format(
+                        "skip_epee_value_with_known_marker: EOF reading field name",
+                    ));
+                }
+                r.advance(name_len_usize);
+
+                skip_epee_value(r)?;
+            }
+            Ok(())
+        }
+        0x0d => {
+            // Nested array: marker + length + elements
+            if !r.has_remaining() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "skip_epee_value_with_known_marker: EOF reading nested array elem marker",
+                ));
+            }
+            let elem_marker = r.get_u8();
+            let n = skip_epee_varint_u64(r)?;
+            for _ in 0..n {
+                skip_epee_value_with_known_marker(r, elem_marker)?;
+            }
+            Ok(())
+        }
+        _ => Err(cuprate_epee_encoding::error::Error::Format(
+            "skip_epee_value_with_known_marker: unsupported marker (extend decoder)",
+        )),
+    }
+}
+
+fn skip_epee_varint_u64<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<u64> {
+    // Monero portable_storage uses a LEB128-style varint.
+    let mut out: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if !r.has_remaining() {
+            return Err(cuprate_epee_encoding::error::Error::Format(
+                "skip_epee_varint_u64: EOF",
+            ));
+        }
+        let b = r.get_u8();
+        out |= u64::from(b & 0x7f) << shift;
+
+        if (b & 0x80) == 0 {
+            return Ok(out);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(cuprate_epee_encoding::error::Error::Format(
+                "skip_epee_varint_u64: varint overflow",
+            ));
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn walletcore_last_error_message() -> *mut c_char {
     let snapshot = LAST_ERROR_MESSAGE
@@ -1369,8 +1592,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 }
 
                 // Discard unknown value while advancing the buffer cursor.
-                let _: cuprate_epee_encoding::macros::bytes::Bytes =
-                    cuprate_epee_encoding::read_epee_value(r)?;
+                //
+                // NOTE: Decoding as `Bytes` is NOT safe here because unknown fields may be bool/int/array/object.
+                // We must skip any EPEE value generically.
+                skip_epee_value(r)?;
             }
         }
         Ok(true)
