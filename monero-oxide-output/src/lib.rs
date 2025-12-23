@@ -1328,12 +1328,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 }
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
-            "pruned" => {
-                if bulk_bin_debug_enabled() {
-                    println!("🧩 get_blocks(.bin) block_complete_entry: field='pruned'");
-                }
-                self.pruned = Some(cuprate_epee_encoding::read_epee_value(r)?);
-            }
 
             // Be permissive with common field name variants observed across daemons / implementations.
             // We normalize them into our internal `txs` list.
@@ -1347,23 +1341,36 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                 self.txs = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
 
+            "pruned" => {
+                if bulk_bin_debug_enabled() {
+                    println!("🧩 get_blocks(.bin) block_complete_entry: field='pruned'");
+                }
+                self.pruned = Some(cuprate_epee_encoding::read_epee_value(r)?);
+            }
+
             _ => {
-                // Schema discovery: log unknown fields once (they may include tx blob fields like
-                // "txs_blob", "txs_blobs", etc.). We log at least once, and we also optionally
-                // log every unknown field when debug is enabled.
+                // IMPORTANT:
+                // For `/getblocks.bin`, Monero's `block_complete_entry` may contain additional fields
+                // (beyond `block`, `txs`, `pruned`). If we return `Ok(false)` without consuming the
+                // field value, the decoder cursor becomes misaligned and we can hit:
+                // "Marker does not match expected Marker".
+                //
+                // Therefore: read and discard unknown field values to keep decoding aligned.
                 if bulk_bin_debug_enabled() {
                     println!(
-                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')",
+                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?}",
                         name
                     );
                 } else if !BULK_BIN_UNKNOWN_FIELD_LOGGED.swap(true, Ordering::Relaxed) {
-                    // Use println! (not print!) to ensure it reliably shows up in iOS log collectors.
                     println!(
-                        "🧩 get_blocks(.bin) block_complete_entry: unknown field {:?} (tx blob field name may differ from 'txs')",
+                        "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?}",
                         name
                     );
                 }
-                return Ok(false);
+
+                // Discard unknown value while advancing the buffer cursor.
+                let _: cuprate_epee_encoding::macros::bytes::Bytes =
+                    cuprate_epee_encoding::read_epee_value(r)?;
             }
         }
         Ok(true)
