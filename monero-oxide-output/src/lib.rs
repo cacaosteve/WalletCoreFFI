@@ -804,7 +804,12 @@ struct GetBlocksFastBinRequest {
     // COMMAND_RPC_GET_BLOCKS_FAST::request_t fields
     // See monero/src/rpc/core_rpc_server_commands_defs.h (KV_SERIALIZE_* map)
     requested_info: u8,
-    block_ids: Vec<[u8; 32]>,
+
+    // IMPORTANT: In Monero C++ this is serialized with `KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids)`.
+    // That means it's encoded as a single blob of bytes (32 * N) rather than a normal EPEE array.
+    // We represent it as a packed blob to match daemon expectations and avoid HTTP 400.
+    block_ids: Vec<u8>,
+
     start_height: u64,
     prune: bool,
     no_miner_tx: bool,
@@ -815,7 +820,7 @@ struct GetBlocksFastBinRequest {
 #[derive(Default)]
 struct GetBlocksFastBinRequestBuilder {
     requested_info: Option<u8>,
-    block_ids: Option<Vec<[u8; 32]>>,
+    block_ids: Option<Vec<u8>>,
     start_height: Option<u64>,
     prune: Option<bool>,
     no_miner_tx: Option<bool>,
@@ -836,6 +841,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinRequest>
                 self.requested_info = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
             "block_ids" => {
+                // Packed POD blob (32 * N bytes)
                 self.block_ids = Some(cuprate_epee_encoding::read_epee_value(r)?);
             }
             "start_height" => {
@@ -886,6 +892,7 @@ impl EpeeObject for GetBlocksFastBinRequest {
 
     fn write_fields<B: BufMut>(self, w: &mut B) -> cuprate_epee_encoding::error::Result<()> {
         write_field(self.requested_info, "requested_info", w)?;
+        // Packed POD blob (32 * N bytes), matching KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids)
         write_field(self.block_ids, "block_ids", w)?;
         write_field(self.start_height, "start_height", w)?;
         write_field(self.prune, "prune", w)?;
@@ -1603,9 +1610,17 @@ impl BlockingRpcTransport {
         // no_miner_tx defaults to false,
         // pool_info_since defaults to 0,
         // max_block_count defaults to 0.
+        //
+        // IMPORTANT: `block_ids` must be encoded as KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids),
+        // i.e. as a single packed blob of 32-byte hashes.
+        let mut block_ids_blob: Vec<u8> = Vec::with_capacity(block_ids.len().saturating_mul(32));
+        for h in block_ids {
+            block_ids_blob.extend_from_slice(&h);
+        }
+
         let req = GetBlocksFastBinRequest {
             requested_info: 0,
-            block_ids,
+            block_ids: block_ids_blob,
             start_height,
             prune,
             no_miner_tx: false,
