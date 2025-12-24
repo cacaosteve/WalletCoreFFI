@@ -25,6 +25,23 @@ enum BulkFetchMode {
     RangeBlocks,
 }
 
+fn build_stamp() -> &'static str {
+    // Prefer a compile-time stamp if provided by the build system.
+    // You can set this from Xcode/SPM via Rust flags or build scripts, e.g.
+    // RUSTFLAGS="--cfg walletcore_build_stamp=\\"...\\""
+    //
+    // Fallback: "unknown" (still useful to prove whether you're running a build that includes this log).
+    option_env!("WALLETCORE_BUILD_STAMP").unwrap_or("unknown")
+}
+
+fn bulk_mode_str(mode: BulkFetchMode) -> &'static str {
+    match mode {
+        BulkFetchMode::Wallet2FastBlocks => "wallet2(getblocks.bin)",
+        BulkFetchMode::RangeBlocks => "range(get_blocks.bin)",
+        BulkFetchMode::PerBlock => "per_block",
+    }
+}
+
 #[inline]
 fn bulk_fetch_mode_from_env() -> BulkFetchMode {
     // Bulk mode selection:
@@ -2962,6 +2979,36 @@ pub extern "C" fn wallet_refresh(
         .or(env_url)
         .unwrap_or_else(|| "http://127.0.0.1:18081".to_string());
 
+    // Refresh entry stamp: proves which core build is actually running.
+    // This is intentionally one-line and stable so you can grep for it in device logs.
+    let env_par = std::env::var("WALLETCORE_SCAN_PAR")
+        .ok()
+        .unwrap_or_else(|| "(unset)".to_string());
+    let env_batch = std::env::var("WALLETCORE_SCAN_BATCH")
+        .ok()
+        .unwrap_or_else(|| "(unset)".to_string());
+    let env_bulk_fetch = std::env::var("WALLETCORE_BULK_FETCH")
+        .ok()
+        .unwrap_or_else(|| "(unset)".to_string());
+    let env_bulk_mode = std::env::var("WALLETCORE_BULK_MODE")
+        .ok()
+        .unwrap_or_else(|| "(default=wallet2)".to_string());
+    let env_bulk_fetch_batch = std::env::var("WALLETCORE_BULK_FETCH_BATCH")
+        .ok()
+        .unwrap_or_else(|| "(default=200)".to_string());
+
+    print!(
+        "🧩 walletcore refresh entry: build={} wallet_id={} node_url={} env{{scan_par={} scan_batch={} bulk_fetch={} bulk_mode={} bulk_fetch_batch={}}}\n",
+        build_stamp(),
+        id,
+        base_url,
+        env_par,
+        env_batch,
+        env_bulk_fetch,
+        env_bulk_mode,
+        env_bulk_fetch_batch
+    );
+
     let rpc_client = match BlockingRpcTransport::new(&base_url) {
         Ok(client) => client,
         Err(code) => {
@@ -3073,7 +3120,7 @@ pub extern "C" fn wallet_refresh(
         .map(|s| s != "0")
         .unwrap_or(true);
 
-    // Binary bulk fetch mode (future path): batch fetch blocks via monerod *.bin endpoints.
+    // Binary bulk fetch mode: batch fetch blocks via monerod *.bin endpoints.
     // Default: ON for clearnet. Turn off with WALLETCORE_BULK_FETCH=0.
     //
     // NOTE: We default-enable the mode here, but will only take the bin path when scanning over
@@ -3081,6 +3128,14 @@ pub extern "C" fn wallet_refresh(
     // due to higher latency and stricter proxy behavior.
     let bulk_fetch_mode: BulkFetchMode = bulk_fetch_mode_from_env();
     let bulk_fetch_batch: usize = bulk_fetch_batch_from_env();
+
+    // Log the resolved bulk mode once per refresh (before any worker gating).
+    // This disambiguates "env says bulk=1" from "effective mode got forced to per-block due to policy".
+    print!(
+        "🧱 bulk-fetch mode resolved: requested={} batch={} (pre-clearnet-gating)\n",
+        bulk_mode_str(bulk_fetch_mode),
+        bulk_fetch_batch
+    );
 
     // Bulk worker span (how many consecutive heights a worker scans in one go when bulk is enabled).
     // Default: 200 blocks. Increase for fewer RPC calls; decrease for more granular progress/cancellation.
