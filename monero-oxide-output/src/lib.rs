@@ -608,9 +608,14 @@ fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()
             Ok(())
         }
 
-        _ => Err(cuprate_epee_encoding::error::Error::Format(
-            "skip_epee_value: unsupported marker (extend decoder)",
-        )),
+        _ => {
+            // Include the actual marker byte to make it diagnosable when daemons use markers we
+            // haven't covered yet.
+            Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                format!("skip_epee_value: unsupported marker=0x{marker:02x} (extend decoder)")
+                    .into_boxed_str(),
+            )))
+        }
     }
 }
 
@@ -688,9 +693,12 @@ fn skip_epee_value_with_known_marker<B: Buf>(
             }
             Ok(())
         }
-        _ => Err(cuprate_epee_encoding::error::Error::Format(
-            "skip_epee_value_with_known_marker: unsupported marker (extend decoder)",
-        )),
+        _ => Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+            format!(
+                "skip_epee_value_with_known_marker: unsupported marker=0x{marker:02x} (extend decoder)"
+            )
+            .into_boxed_str(),
+        ))),
     }
 }
 
