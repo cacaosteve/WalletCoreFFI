@@ -117,7 +117,9 @@ fn read_txs_marker_0x8c<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Resu
         let m = r.get_u8();
         match m {
             // Strings / blobs (length-prefixed bytes). Treat both the same.
-            0x0a | 0x0b => {
+            //
+            // Observed in the wild: 0xba can appear as a blob-like marker within txs(0x8c).
+            0x0a | 0x0b | 0xba => {
                 let len = skip_epee_varint_u64(r)?;
                 let len_usize = usize::try_from(len).map_err(|_| {
                     cuprate_epee_encoding::error::Error::Format(
@@ -655,7 +657,10 @@ fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()
 
         // Strings / blobs: varint length + bytes.
         // We treat both as "length-prefixed byte sequences".
-        0x0a | 0x0b => {
+        //
+        // Observed in the wild (monerod wallet2 `/getblocks.bin`): marker 0xba can appear for blob-like
+        // data (e.g., tx blobs). Treat it the same as string/blob.
+        0x0a | 0x0b | 0xba => {
             let len = skip_epee_varint_u64(r)?;
             let len_usize = usize::try_from(len).map_err(|_| {
                 cuprate_epee_encoding::error::Error::Format("skip_epee_value: length overflow")
@@ -748,7 +753,7 @@ fn skip_epee_value_with_known_marker<B: Buf>(
             r.advance(8);
             Ok(())
         }
-        0x0a | 0x0b => {
+        0x0a | 0x0b | 0xba => {
             let len = skip_epee_varint_u64(r)?;
             let len_usize = usize::try_from(len).map_err(|_| {
                 cuprate_epee_encoding::error::Error::Format(
