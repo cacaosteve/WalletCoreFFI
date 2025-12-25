@@ -1784,7 +1784,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     for i in 0..n {
                         if bulk_bin_debug_enabled() {
                             println!(
-                                "🧩 getblocks.bin blocks[{}]: decode block-blob start (remaining={})",
+                                "🧩 getblocks.bin blocks[{}]: decode block-bytes start (remaining={})",
                                 i,
                                 r.remaining()
                             );
@@ -1792,26 +1792,41 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                         if !r.has_remaining() {
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing blob marker)")
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing element bytes)")
                                     .into_boxed_str(),
                             )));
                         }
 
-                        let m = r.get_u8();
-                        // Treat common blob/string markers uniformly.
-                        if m != 0x0a && m != 0x0b {
+                        // Typed-array elements are typically markerless (type is declared by the header).
+                        // However, we observed the element stream sometimes starting with an EPEE blob marker (0x0a/0x0b),
+                        // so we support both:
+                        //   A) marker+len:   [0x0a|0x0b][varint_len][bytes]
+                        //   B) markerless:   [varint_len][bytes]
+                        let chunk = r.chunk();
+                        if chunk.is_empty() {
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] unexpected blob marker=0x{m:02x} (expected 0x0a/0x0b)")
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] unable to peek element bytes")
                                     .into_boxed_str(),
                             )));
                         }
 
-                        let block_bytes =
-                            read_epee_len_prefixed_bytes(r, "getblocks.bin blocks(block_blob)")?;
+                        let block_bytes: Vec<u8> = if chunk[0] == 0x0a || chunk[0] == 0x0b {
+                            let _m = r.get_u8();
+                            read_epee_len_prefixed_bytes(
+                                r,
+                                "getblocks.bin blocks(block_blob,marker)",
+                            )?
+                        } else {
+                            // markerless length-prefixed bytes
+                            read_epee_len_prefixed_bytes(
+                                r,
+                                "getblocks.bin blocks(block_blob,markerless)",
+                            )?
+                        };
 
                         if bulk_bin_debug_enabled() {
                             println!(
-                                "🧩 getblocks.bin blocks[{}]: decode block-blob ok (block_bytes={})",
+                                "🧩 getblocks.bin blocks[{}]: decode block-bytes ok (len={})",
                                 i,
                                 block_bytes.len()
                             );
