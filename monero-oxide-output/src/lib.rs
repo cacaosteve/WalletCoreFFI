@@ -25,7 +25,7 @@ enum BulkFetchMode {
     RangeBlocks,
 }
 
-const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v5";
+const WALLETCORE_LOG_VERSION: &str = "walletcore-log-v6";
 
 fn build_stamp() -> &'static str {
     // Prefer a compile-time stamp if provided by the build system.
@@ -1852,6 +1852,19 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                                 }
                             }
                         };
+
+                        if bulk_bin_debug_enabled()
+                            && matches!(typed_elem_type.as_deref(), Some(""))
+                            && !has_marker
+                            && i == 0
+                        {
+                            println!(
+                                "🧩 getblocks.bin blocks typed-array elem_type empty: first markerless len_u64={} varint_bytes={} remaining={}",
+                                len_u64,
+                                len_varint_bytes,
+                                r.remaining()
+                            );
+                        }
 
                         let len_usize = match usize::try_from(len_u64) {
                             Ok(v) => v,
