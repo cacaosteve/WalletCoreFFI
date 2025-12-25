@@ -1996,6 +1996,11 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 //
                 // For a typed array, `blocks_elem_marker` applies to ALL elements, and elements do NOT include
                 // a per-element marker.
+                //
+                // IMPORTANT: the typed-array header already consumed `blocks_elem_marker`, and the element stream
+                // starts immediately after it. However, the element values are still encoded as blob-like values
+                // in portable_storage, so each element begins with the blob marker byte. We must therefore
+                // skip the per-element marker before reading the varint length + payload.
                 const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024; // 10 MiB cap (defensive)
 
                 if !is_supported_blob_marker(blocks_elem_marker) {
@@ -2029,7 +2034,29 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                     }
 
-                    // Each element is just a length-prefixed byte array: [varint_len][payload...]
+                    if reader_blob.is_empty() {
+                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing element bytes)")
+                                .into_boxed_str(),
+                        )));
+                    }
+
+                    // Each element is encoded as: [marker][varint_len][payload...]
+                    // The marker should match the shared typed-array element marker.
+                    let marker = reader_blob[0];
+                    if marker != blocks_elem_marker {
+                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                            format!(
+                                "getblocks.bin decode failed in field 'blocks': blocks[{i}] unexpected blob marker=0x{marker:02x} (expected 0x{blocks_elem_marker:02x})"
+                            )
+                            .into_boxed_str(),
+                        )));
+                    }
+
+                    // Skip marker, then parse length-prefixed payload.
+                    reader_blob = &reader_blob[1..];
+
+                    // Validate length prefix bounds before allocating.
                     if let Some((len_u64, used)) = peek_epee_varint_u64(reader_blob) {
                         let len_usize = usize::try_from(len_u64).map_err(|_| {
                             cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -2054,7 +2081,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                     } else {
                         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length (shared marker)")
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length after blob marker (shared marker)")
                                 .into_boxed_str(),
                         )));
                     }
