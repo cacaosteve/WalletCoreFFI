@@ -1775,10 +1775,25 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                 // Decode elements.
                 //
-                // If typed_elem_type is "block", the element stream is a sequence of length-prefixed block blobs
-                // (EPEE blob/string markers). Map each into a `BlockCompleteEntry` with empty `txs` so the
-                // scanner can proceed (and optionally fall back to per-block tx fetch later).
-                if matches!(typed_elem_type.as_deref(), Some("block")) {
+                // If typed_elem_type is "block" OR empty, treat it as a sequence of length-prefixed bytes
+                // (typed arrays may omit the element type name on some daemons).
+                //
+                // We support both:
+                //   A) marker+len:   [0x0a|0x0b][varint_len][bytes]
+                //   B) markerless:   [varint_len][bytes]
+                //
+                // Sanity checks:
+                // - element length must fit in remaining buffer
+                // - optional upper bound to avoid pathological allocations
+                let typed_is_block_bytes = match typed_elem_type.as_deref() {
+                    Some("block") => true,
+                    Some("") => true,
+                    _ => false,
+                };
+
+                if typed_is_block_bytes {
+                    const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024; // 10 MiB cap (defensive)
+
                     let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
 
                     for i in 0..n {
@@ -1797,11 +1812,6 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             )));
                         }
 
-                        // Typed-array elements are typically markerless (type is declared by the header).
-                        // However, we observed the element stream sometimes starting with an EPEE blob marker (0x0a/0x0b),
-                        // so we support both:
-                        //   A) marker+len:   [0x0a|0x0b][varint_len][bytes]
-                        //   B) markerless:   [varint_len][bytes]
                         let chunk = r.chunk();
                         if chunk.is_empty() {
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -1810,19 +1820,72 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             )));
                         }
 
-                        let block_bytes: Vec<u8> = if chunk[0] == 0x0a || chunk[0] == 0x0b {
-                            let _m = r.get_u8();
-                            read_epee_len_prefixed_bytes(
-                                r,
-                                "getblocks.bin blocks(block_blob,marker)",
-                            )?
+                        // Compute the prospective length without consuming bytes so we can validate bounds.
+                        // Marker+len case: [0x0a|0x0b][varint_len][bytes]
+                        let (has_marker, len_u64, len_varint_bytes) = if chunk[0] == 0x0a
+                            || chunk[0] == 0x0b
+                        {
+                            if chunk.len() < 2 {
+                                return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                    format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF after blob marker")
+                                        .into_boxed_str(),
+                                )));
+                            }
+                            match peek_epee_varint_u64(&chunk[1..]) {
+                                Some((len, used)) => (true, len, used),
+                                None => {
+                                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                        format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length after blob marker")
+                                            .into_boxed_str(),
+                                    )));
+                                }
+                            }
                         } else {
-                            // markerless length-prefixed bytes
-                            read_epee_len_prefixed_bytes(
-                                r,
-                                "getblocks.bin blocks(block_blob,markerless)",
-                            )?
+                            // Markerless case: [varint_len][bytes]
+                            match peek_epee_varint_u64(chunk) {
+                                Some((len, used)) => (false, len, used),
+                                None => {
+                                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                        format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length (markerless)")
+                                            .into_boxed_str(),
+                                    )));
+                                }
+                            }
                         };
+
+                        let len_usize = match usize::try_from(len_u64) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                    format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] length overflow ({len_u64})")
+                                        .into_boxed_str(),
+                                )));
+                            }
+                        };
+
+                        if len_usize > MAX_BLOCK_BYTES {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element too large (len={len_usize} > {MAX_BLOCK_BYTES})")
+                                    .into_boxed_str(),
+                            )));
+                        }
+
+                        // Validate that the payload fits within remaining buffer (including varint bytes and optional marker).
+                        let rem = r.remaining();
+                        let overhead = len_varint_bytes + if has_marker { 1 } else { 0 };
+                        if rem < overhead + len_usize {
+                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element length out of bounds (len={len_usize}, overhead={overhead}, remaining={rem})")
+                                    .into_boxed_str(),
+                            )));
+                        }
+
+                        // Consume and read bytes.
+                        if has_marker {
+                            let _ = r.get_u8(); // marker
+                        }
+                        let block_bytes =
+                            read_epee_len_prefixed_bytes(r, "getblocks.bin blocks(block_bytes)")?;
 
                         if bulk_bin_debug_enabled() {
                             println!(
