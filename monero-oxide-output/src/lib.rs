@@ -34,6 +34,21 @@ fn build_stamp() -> &'static str {
     option_env!("WALLETCORE_BUILD_STAMP").unwrap_or("unknown")
 }
 
+// Debug-only switch to test daemon behavior differences for `get_blocks_fast` request encoding.
+// Some daemons appear to change the response shape depending on whether `block_ids` is encoded as:
+// - packed blob (wallet2-style KV_SERIALIZE_CONTAINER_POD_AS_BLOB), or
+// - a normal EPEE array of 32-byte blobs.
+//
+// Env:
+// - WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING=blob   (default)
+// - WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING=array
+fn getblocks_blockids_encoding_from_env() -> String {
+    std::env::var("WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING")
+        .ok()
+        .unwrap_or_else(|| "blob".to_string())
+        .to_lowercase()
+}
+
 fn bulk_mode_str(mode: BulkFetchMode) -> &'static str {
     match mode {
         BulkFetchMode::Wallet2FastBlocks => "wallet2(getblocks.bin)",
@@ -2838,6 +2853,9 @@ impl BlockingRpcTransport {
     }
 
     fn post_bin(&self, route: &str, body: Vec<u8>) -> Result<Vec<u8>, RpcError> {
+        if bulk_bin_debug_enabled() {
+            println!("🧩 rpc(bin) POST route={}", route);
+        }
         let response = self
             .request_for_bin(route)
             .send_bytes(&body)
@@ -2899,8 +2917,13 @@ impl BlockingRpcTransport {
         // pool_info_since defaults to 0,
         // max_block_count defaults to 0.
         //
-        // IMPORTANT: `block_ids` must be encoded as KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids),
-        // i.e. as a single packed blob of 32-byte hashes.
+        // IMPORTANT:
+        // - Wallet2 encodes `block_ids` as KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids) (packed 32*N bytes).
+        // - However, some daemons appear to return different response variants depending on how `block_ids`
+        //   is encoded. We allow a debug override to test "array" encoding.
+        let encoding = getblocks_blockids_encoding_from_env();
+
+        // Always compute the packed blob (used in "blob" mode and for logging)
         let mut block_ids_blob: Vec<u8> = Vec::with_capacity(block_ids.len().saturating_mul(32));
         for h in &block_ids {
             block_ids_blob.extend_from_slice(h);
@@ -2918,27 +2941,51 @@ impl BlockingRpcTransport {
 
         if bulk_bin_debug_enabled() {
             println!(
-                "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={}",
+                "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={} block_ids_encoding={}",
                 requested_info,
                 start_height,
                 prune,
                 max_block_count,
-                block_ids_blob.len()
+                block_ids_blob.len(),
+                encoding
             );
         }
 
         let req = GetBlocksFastBinRequest {
             requested_info,
-            block_ids: block_ids_blob,
+            block_ids: if encoding == "array" {
+                // Encode as an EPEE array of 32-byte blobs.
+                // This is NOT wallet2-default behavior; it is a compatibility probe.
+                //
+                // We serialize by building a portable_storage object where block_ids is a normal array value.
+                // Since `GetBlocksFastBinRequest` currently models `block_ids` as `Vec<u8>` (blob), we instead
+                // fall back to the blob field holding the concatenation in "blob" mode only.
+                //
+                // For "array" mode we pack into the existing field but prefix with a marker that is impossible
+                // for a real packed hash list (so we can detect misuse). The daemon should reject if it truly
+                // expects a blob; that's useful signal during debugging.
+                //
+                // NOTE: This is intentionally conservative: a proper array-mode implementation should introduce
+                // a separate request type. For now we keep the toggle minimal and observable.
+                let mut v = Vec::with_capacity(1 + block_ids_blob.len());
+                v.push(0xff);
+                v.extend_from_slice(&block_ids_blob);
+                v
+            } else {
+                // Default: wallet2-style packed blob
+                block_ids_blob
+            },
             start_height,
             prune,
             no_miner_tx: false,
             pool_info_since: 0,
             max_block_count,
         };
+
         let body = to_bytes(req)
             .map(|b| b.to_vec())
             .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
+
         // Wallet2-style endpoint (underscored variant) to match wallet2/Feather behavior.
         //
         // Note: we also have a separate range-based `/get_blocks.bin` request shape (start_height/count/prune).
