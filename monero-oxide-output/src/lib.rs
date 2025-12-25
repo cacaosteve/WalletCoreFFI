@@ -59,87 +59,156 @@ fn read_epee_field_name<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Resu
     Ok(s.to_string())
 }
 
-/// Custom decoder for `block_complete_entry.txs` for daemons which encode it using a marker `0x8c`.
+fn read_epee_len_prefixed_bytes<B: Buf>(
+    r: &mut B,
+    ctx: &'static str,
+) -> cuprate_epee_encoding::error::Result<Vec<u8>> {
+    let len = skip_epee_varint_u64(r)?;
+    let len_usize = usize::try_from(len).map_err(|_| {
+        cuprate_epee_encoding::error::Error::Format(Box::leak(
+            format!("{ctx}: length overflow").into_boxed_str(),
+        ))
+    })?;
+    if r.remaining() < len_usize {
+        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+            format!("{ctx}: EOF reading bytes").into_boxed_str(),
+        )));
+    }
+    Ok(r.copy_to_bytes(len_usize).to_vec())
+}
+
+/// Spec-driven typed-array parser for the observed `txs` encoding in wallet2 `/getblocks.bin`.
 ///
-/// Based on observed leading bytes:
-/// - 0x8c d9 01 08 04 'blob' ...
-/// which indicates an array-like container with an embedded element schema ("blob").
+/// Observed on your daemon:
+/// - marker 0x8c
+/// - varint count
+/// - small schema header that includes an element type name (e.g. "blob")
+/// - then N elements encoded as length-prefixed byte blobs
 ///
-/// We parse enough to recover the tx blob byte arrays without relying on cuprate's generic value decoder.
-fn read_txs_marker_0x8c<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<Vec<Vec<u8>>> {
+/// Instead of guessing multiple blob markers (0xba/0xcf/...), we rely on the embedded element type name.
+/// For element_type="blob", we decode each element as a length-prefixed byte sequence.
+///
+/// If we encounter an unexpected element type, we skip elements generically to keep the cursor aligned.
+fn read_txs_typed_array_0x8c<B: Buf>(
+    r: &mut B,
+) -> cuprate_epee_encoding::error::Result<Vec<Vec<u8>>> {
     if !r.has_remaining() {
         return Err(cuprate_epee_encoding::error::Error::Format(
-            "read_txs_marker_0x8c: EOF (missing marker)",
+            "read_txs_typed_array_0x8c: EOF (missing marker)",
         ));
     }
     let marker = r.get_u8();
     if marker != 0x8c {
         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("read_txs_marker_0x8c: unexpected marker=0x{marker:02x}").into_boxed_str(),
+            format!("read_txs_typed_array_0x8c: unexpected marker=0x{marker:02x}").into_boxed_str(),
         )));
     }
 
-    // After 0x8c we observe a varint-ish length (e.g. d9 01 => 217).
-    // Treat it as element count.
-    let n = skip_epee_varint_u64(r)? as usize;
+    // 1) Element count
+    let n_u64 = skip_epee_varint_u64(r)?;
+    let n = usize::try_from(n_u64).map_err(|_| {
+        cuprate_epee_encoding::error::Error::Format("read_txs_typed_array_0x8c: count overflow")
+    })?;
 
-    // Next we observe: 08 04 'blob' ...
-    // This looks like a small schema/header indicating the element type name.
-    // We'll parse a marker-like byte (ignored), then a varint length + string (type name).
+    // 2) Typed-array schema header:
+    // We observed bytes like: 08 04 'blob' ...
+    // Interpret this as: <schema_marker:u8> <type_name_len:varint> <type_name_bytes>.
     if !r.has_remaining() {
         return Err(cuprate_epee_encoding::error::Error::Format(
-            "read_txs_marker_0x8c: EOF (missing schema marker)",
+            "read_txs_typed_array_0x8c: EOF (missing schema marker)",
         ));
     }
     let _schema_marker = r.get_u8();
     let type_name_len = skip_epee_varint_u64(r)?;
     let type_name_len_usize = usize::try_from(type_name_len).map_err(|_| {
         cuprate_epee_encoding::error::Error::Format(
-            "read_txs_marker_0x8c: type name length overflow",
+            "read_txs_typed_array_0x8c: type name length overflow",
         )
     })?;
     if r.remaining() < type_name_len_usize {
         return Err(cuprate_epee_encoding::error::Error::Format(
-            "read_txs_marker_0x8c: EOF reading type name",
+            "read_txs_typed_array_0x8c: EOF reading type name",
         ));
     }
-    let _type_name = r.copy_to_bytes(type_name_len_usize);
+    let type_name_bytes = r.copy_to_bytes(type_name_len_usize);
+    let elem_type = std::str::from_utf8(&type_name_bytes)
+        .unwrap_or("")
+        .to_string();
 
-    // Now parse `n` blobs. Each blob is expected to be encoded as:
-    // marker (string/blob) + varint length + bytes.
+    // 3) Decode elements.
+    // For elem_type == "blob": parse each element as a length-prefixed byte array.
+    // The element itself may still be prefixed by a marker; if so, handle it conservatively:
+    // - if it's a known byte/blob/string marker, consume it and then read len+bytes
+    // - otherwise fall back to generic skipping, inserting an empty blob as a placeholder
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for _ in 0..n {
-        if !r.has_remaining() {
+
+    if elem_type == "blob" {
+        for _ in 0..n {
+            if !r.has_remaining() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "read_txs_typed_array_0x8c: EOF reading element",
+                ));
+            }
+
+            // Elements are often prefixed by a marker; accept several byte/blob markers.
+            let chunk = r.chunk();
+            if !chunk.is_empty() {
+                let m = chunk[0];
+                match m {
+                    // Known byte/blob/string markers (length-prefixed). Consume marker and read bytes.
+                    0x0a | 0x0b | 0xba | 0xcf => {
+                        let _ = r.get_u8();
+                        let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob)")?;
+                        out.push(b);
+                        continue;
+                    }
+                    _ => {
+                        // If the daemon uses "no per-element marker" encoding for typed arrays,
+                        // then the element starts directly with a varint length.
+                        // Try that first (non-destructive isn't possible), so only attempt it when
+                        // the next byte looks like a varint prefix (<= 0x7f) to reduce false positives.
+                        if m <= 0x7f {
+                            let b = read_epee_len_prefixed_bytes(
+                                r,
+                                "read_txs_typed_array_0x8c(blob,no_marker)",
+                            )?;
+                            out.push(b);
+                            continue;
+                        }
+
+                        // Otherwise: skip generically (keeps alignment) and mark missing.
+                        let _ = r.get_u8();
+                        skip_epee_value_with_known_marker(r, m)?;
+                        out.push(Vec::new());
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback when chunk() is empty but remaining() > 0 (rare): treat as error
             return Err(cuprate_epee_encoding::error::Error::Format(
-                "read_txs_marker_0x8c: EOF reading blob marker",
+                "read_txs_typed_array_0x8c: unable to peek element marker",
             ));
         }
-        let m = r.get_u8();
-        match m {
-            // Strings / blobs (length-prefixed bytes). Treat both the same.
-            //
-            // Observed in the wild: 0xba can appear as a blob-like marker within txs(0x8c).
-            0x0a | 0x0b | 0xba => {
-                let len = skip_epee_varint_u64(r)?;
-                let len_usize = usize::try_from(len).map_err(|_| {
-                    cuprate_epee_encoding::error::Error::Format(
-                        "read_txs_marker_0x8c: blob length overflow",
-                    )
-                })?;
-                if r.remaining() < len_usize {
-                    return Err(cuprate_epee_encoding::error::Error::Format(
-                        "read_txs_marker_0x8c: EOF reading blob bytes",
-                    ));
-                }
-                let b = r.copy_to_bytes(len_usize);
-                out.push(b.to_vec());
+    } else {
+        // Unknown element type: skip elements conservatively.
+        // We keep alignment and return empty blobs so caller can fall back if needed.
+        for _ in 0..n {
+            if !r.has_remaining() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "read_txs_typed_array_0x8c: EOF skipping element",
+                ));
             }
-            // Some daemons may wrap elements as objects; if so, skip the element generically.
-            // We push an empty blob so the caller can fall back to per-block fetch for missing txs.
-            _ => {
-                skip_epee_value_with_known_marker(r, m)?;
-                out.push(Vec::new());
+            let chunk = r.chunk();
+            if chunk.is_empty() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "read_txs_typed_array_0x8c: unable to peek element marker",
+                ));
             }
+            let m = chunk[0];
+            let _ = r.get_u8();
+            skip_epee_value_with_known_marker(r, m)?;
+            out.push(Vec::new());
         }
     }
 
@@ -658,9 +727,9 @@ fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()
         // Strings / blobs: varint length + bytes.
         // We treat both as "length-prefixed byte sequences".
         //
-        // Observed in the wild (monerod wallet2 `/getblocks.bin`): marker 0xba can appear for blob-like
-        // data (e.g., tx blobs). Treat it the same as string/blob.
-        0x0a | 0x0b | 0xba => {
+        // Observed in the wild (monerod wallet2 `/getblocks.bin`): markers 0xba and 0xcf can appear for blob-like
+        // data (e.g., tx blobs). Treat them the same as string/blob.
+        0x0a | 0x0b | 0xba | 0xcf => {
             let len = skip_epee_varint_u64(r)?;
             let len_usize = usize::try_from(len).map_err(|_| {
                 cuprate_epee_encoding::error::Error::Format("skip_epee_value: length overflow")
@@ -753,7 +822,7 @@ fn skip_epee_value_with_known_marker<B: Buf>(
             r.advance(8);
             Ok(())
         }
-        0x0a | 0x0b | 0xba => {
+        0x0a | 0x0b | 0xba | 0xcf => {
             let len = skip_epee_varint_u64(r)?;
             let len_usize = usize::try_from(len).map_err(|_| {
                 cuprate_epee_encoding::error::Error::Format(
@@ -1729,12 +1798,13 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                     );
                 }
 
-                // Some daemons encode `txs` with a non-standard marker (observed 0x8c).
-                // Try a custom parser first; fall back to cuprate's generic decoder otherwise.
+                // Some daemons encode `txs` with a typed-array marker (observed 0x8c + element type name "blob").
+                // Parse it in a spec-driven way keyed by the embedded element type name.
+                // Fall back to cuprate's generic decoder for other encodings.
                 let txs_value = {
                     let chunk = r.chunk();
                     if !chunk.is_empty() && chunk[0] == 0x8c {
-                        read_txs_marker_0x8c(r)?
+                        read_txs_typed_array_0x8c(r)?
                     } else {
                         cuprate_epee_encoding::read_epee_value(r)?
                     }
