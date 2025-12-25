@@ -2939,9 +2939,11 @@ impl BlockingRpcTransport {
         let body = to_bytes(req)
             .map(|b| b.to_vec())
             .map_err(|e| RpcError::InvalidNode(format!("epee encode: {e}")))?;
-        // Wallet2-style endpoint (non-underscored variant) to avoid colliding with the range-based
-        // `/get_blocks.bin` request shape (start_height/count/prune).
-        let resp_bytes = self.post_bin("getblocks.bin", body)?;
+        // Wallet2-style endpoint (underscored variant) to match wallet2/Feather behavior.
+        //
+        // Note: we also have a separate range-based `/get_blocks.bin` request shape (start_height/count/prune).
+        // Monerod distinguishes these by the request body schema, not just the route string.
+        let resp_bytes = self.post_bin("get_blocks.bin", body)?;
         let mut reader: &[u8] = resp_bytes.as_slice();
         let resp: GetBlocksFastBinResponse = from_bytes(&mut reader)
             .map_err(|e| RpcError::InvalidNode(format!("epee decode: {e}")))?;
