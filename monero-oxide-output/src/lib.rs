@@ -290,6 +290,24 @@ fn read_txs_typed_array_0x8c<B: Buf>(
             }
 
             // If neither matches, fail fast (do not desync). This will force bulk fallback to per-block.
+            //
+            // Diagnostic: dump bytes at the exact failure point so we can reverse-engineer the true element encoding.
+            if bulk_bin_debug_enabled() {
+                let dump0 = hex_dump_prefix(chunk, 64);
+                let dump1 = if chunk.len() > 1 {
+                    hex_dump_prefix(&chunk[1..], 64)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "🧩 txs(0x8c) element decode failed: next_byte=0x{:02x} remaining={} dump[0..]={} dump[1..]={}",
+                    first,
+                    r.remaining(),
+                    dump0,
+                    dump1
+                );
+            }
+
             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
                 format!(
                     "read_txs_typed_array_0x8c(blob): unrecognized element encoding (next_byte=0x{:02x})",
