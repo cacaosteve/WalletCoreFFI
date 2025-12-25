@@ -77,6 +77,37 @@ fn read_epee_len_prefixed_bytes<B: Buf>(
     Ok(r.copy_to_bytes(len_usize).to_vec())
 }
 
+// Non-destructive peek of Monero portable_storage varint (LEB128-style) from a byte slice.
+// Returns (value, bytes_used) if the varint is well-formed and fits in u64.
+fn peek_epee_varint_u64(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut out: u64 = 0;
+    let mut shift: u32 = 0;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        let low = (b & 0x7f) as u64;
+
+        // Prevent overflow / nonsense shifts
+        if shift >= 64 {
+            return None;
+        }
+
+        out |= low.checked_shl(shift)? as u64;
+
+        if (b & 0x80) == 0 {
+            return Some((out, i + 1));
+        }
+
+        shift = shift.saturating_add(7);
+
+        // Monero varints are small; cap to a sane maximum number of bytes for u64.
+        if i >= 9 {
+            return None;
+        }
+    }
+
+    None
+}
+
 /// Spec-driven typed-array parser for the observed `txs` encoding in wallet2 `/getblocks.bin`.
 ///
 /// Observed on your daemon:
@@ -150,45 +181,69 @@ fn read_txs_typed_array_0x8c<B: Buf>(
                 ));
             }
 
-            // Elements are often prefixed by a marker; accept several byte/blob markers.
             let chunk = r.chunk();
-            if !chunk.is_empty() {
-                let m = chunk[0];
-                match m {
-                    // Known byte/blob/string markers (length-prefixed). Consume marker and read bytes.
-                    0x0a | 0x0b | 0xba | 0xcf => {
+            if chunk.is_empty() {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "read_txs_typed_array_0x8c: unable to peek element bytes",
+                ));
+            }
+
+            // Schema-driven decoding:
+            // For element_type="blob", treat elements as length-prefixed bytes.
+            //
+            // Some daemons prefix each element with a marker byte (which can vary: 0x0a/0x0b/0xba/0xcf/...).
+            // Instead of enumerating marker bytes, we:
+            // - if the next byte *looks like* a marker, peek the following varint length and validate it
+            // - otherwise, treat the element as "no per-element marker" and parse varint length directly
+            let first = chunk[0];
+
+            // Attempt "marker-present" form:
+            // [marker][varint_len][bytes...]
+            //
+            // We only consume the marker if the bytes after it contain a plausible varint length that fits
+            // within remaining buffer (prevents mis-parsing unknown structures).
+            if chunk.len() >= 2 {
+                if let Some((len, used)) = peek_epee_varint_u64(&chunk[1..]) {
+                    let rem_after_marker = r.remaining().saturating_sub(1);
+                    if (used as u64) <= rem_after_marker as u64
+                        && len <= rem_after_marker.saturating_sub(used) as u64
+                    {
+                        // Looks like a marker + length-prefixed blob; consume marker and read bytes.
                         let _ = r.get_u8();
-                        let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob)")?;
-                        out.push(b);
-                        continue;
-                    }
-                    _ => {
-                        // If the daemon uses "no per-element marker" encoding for typed arrays,
-                        // then the element starts directly with a varint length.
-                        // Try that first (non-destructive isn't possible), so only attempt it when
-                        // the next byte looks like a varint prefix (<= 0x7f) to reduce false positives.
-                        if m <= 0x7f {
-                            let b = read_epee_len_prefixed_bytes(
-                                r,
-                                "read_txs_typed_array_0x8c(blob,no_marker)",
-                            )?;
-                            out.push(b);
-                            continue;
+
+                        if bulk_bin_debug_enabled() && first != 0x0a && first != 0x0b {
+                            println!(
+                                "🧩 read_txs_typed_array_0x8c(blob): treating unknown element marker=0x{:02x} as blob (len={})",
+                                first, len
+                            );
                         }
 
-                        // Otherwise: skip generically (keeps alignment) and mark missing.
-                        let _ = r.get_u8();
-                        skip_epee_value_with_known_marker(r, m)?;
-                        out.push(Vec::new());
+                        let b = read_epee_len_prefixed_bytes(r, "read_txs_typed_array_0x8c(blob)")?;
+                        out.push(b);
                         continue;
                     }
                 }
             }
 
-            // Fallback when chunk() is empty but remaining() > 0 (rare): treat as error
-            return Err(cuprate_epee_encoding::error::Error::Format(
-                "read_txs_typed_array_0x8c: unable to peek element marker",
-            ));
+            // Attempt "no per-element marker" form:
+            // [varint_len][bytes...]
+            if let Some((len, used)) = peek_epee_varint_u64(chunk) {
+                let rem = r.remaining();
+                if (used as u64) <= rem as u64 && len <= rem.saturating_sub(used) as u64 {
+                    let b = read_epee_len_prefixed_bytes(
+                        r,
+                        "read_txs_typed_array_0x8c(blob,no_marker)",
+                    )?;
+                    out.push(b);
+                    continue;
+                }
+            }
+
+            // If neither form looks valid, skip one marker byte + its associated value (best-effort)
+            // and record an empty element so higher layers can fall back.
+            let _ = r.get_u8();
+            skip_epee_value_with_known_marker(r, first)?;
+            out.push(Vec::new());
         }
     } else {
         // Unknown element type: skip elements conservatively.
