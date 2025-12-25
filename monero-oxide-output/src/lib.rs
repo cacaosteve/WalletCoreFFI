@@ -1769,7 +1769,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         (n, None)
                     }
 
-                    // Typed array: [0x8c][len][schema_marker][type_name_len][type_name_bytes][element_stream...]
+                    // Typed array: [0x8c][len][schema_marker][type_name_len][type_name_bytes][elem_marker][elements...]
+                    //
+                    // IMPORTANT: In Monero portable_storage, arrays provide the element marker once, and elements
+                    // are then encoded WITHOUT their own markers.
                     0x8c => {
                         let n = skip_epee_varint_u64(r).map_err(|e| {
                             cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -1806,7 +1809,19 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             .unwrap_or("")
                             .to_string();
 
-                        (n, Some(type_name))
+                        if !r.has_remaining() {
+                            return Err(cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'blocks': EOF (missing typed-array element marker)",
+                            ));
+                        }
+                        let elem_marker = r.get_u8();
+
+                        // Pass the element marker to the decoder by appending it to the type name in a stable way.
+                        // This avoids widening the match tuple and keeps changes localized.
+                        (
+                            n,
+                            Some(format!("{type_name}|elem_marker=0x{elem_marker:02x}")),
+                        )
                     }
 
                     _ => {
@@ -1849,24 +1864,19 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                 // Decode elements.
                 //
-                // Daemons appear to vary in how they fill the typed-array `elem_type` string for `blocks`.
-                // Some will label entries as "block" even when each element is actually a portable_storage
-                // object (`block_complete_entry`) containing fields like "block" and "txs".
+                // For typed arrays, Monero portable_storage supplies the element marker ONCE in the header.
+                // Elements are then encoded WITHOUT per-element markers.
                 //
-                // To maximize compatibility (and match wallet2's spirit), we decode from a retryable
-                // "savepoint slice":
-                //   1) Try to decode as `BlockCompleteEntry` objects first (object payloads with field names).
-                //   2) If that fails, retry from the same savepoint and decode as length-prefixed blob bytes.
-                //
-                // This avoids relying on `Buf` rewind APIs (which `bytes::Buf` does not provide).
-                //
-                // The blob fallback supports both:
-                //   A) marker+len:   [0x0a|0x0b][varint_len][bytes]
-                //   B) markerless:   [varint_len][bytes]
-                //
-                // Sanity checks:
-                // - element length must fit in remaining buffer
-                // - upper bound to avoid pathological allocations
+                // We therefore:
+                // - extract the shared element marker from `typed_elem_type` (encoded as `|elem_marker=0x..`)
+                // - decode `n` elements using that marker
+                let blocks_elem_marker: u8 = typed_elem_type
+                    .as_deref()
+                    .and_then(|s| s.split("|elem_marker=0x").nth(1))
+                    .and_then(|hex| u8::from_str_radix(&hex[..2.min(hex.len())], 16).ok())
+                    .unwrap_or(0x0a);
+
+                // Savepoint slice right after the typed-array header (including elem_marker already consumed).
                 let savepoint: &[u8] = r.chunk();
 
                 // --- Attempt 1: decode as `BlockCompleteEntry` objects ---
@@ -1982,12 +1992,20 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     );
                 }
 
-                // --- Attempt 2: decode as length-prefixed blob bytes ---
+                // --- Attempt 2: decode as length-prefixed blob bytes (shared element marker) ---
                 //
-                // IMPORTANT: for this `blocks` typed-array variant we use STRICT marker-based parsing.
-                // The stream is entropy-heavy and markerless varint decoding can easily desync and produce
-                // huge, bogus lengths (as seen in logs).
+                // For a typed array, `blocks_elem_marker` applies to ALL elements, and elements do NOT include
+                // a per-element marker.
                 const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024; // 10 MiB cap (defensive)
+
+                if !is_supported_blob_marker(blocks_elem_marker) {
+                    return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
+                        format!(
+                            "getblocks.bin decode failed in field 'blocks': unsupported typed-array elem_marker=0x{blocks_elem_marker:02x}"
+                        )
+                        .into_boxed_str(),
+                    )));
+                }
 
                 let mut reader_blob: &[u8] = savepoint;
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n as usize);
@@ -1995,8 +2013,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 for i in 0..n {
                     if bulk_bin_debug_enabled() {
                         println!(
-                            "🧩 getblocks.bin blocks[{}]: blob-decode start (remaining={})",
+                            "🧩 getblocks.bin blocks[{}]: blob-decode(shared_marker=0x{:02x}) start (remaining={})",
                             i,
+                            blocks_elem_marker,
                             reader_blob.len()
                         );
                         if !reader_blob.is_empty() {
@@ -2010,68 +2029,14 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                     }
 
-                    if reader_blob.is_empty() {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing element bytes)")
-                                .into_boxed_str(),
-                        )));
-                    }
-
-                    // Per-element adaptive decoding.
-                    //
-                    // We have observed daemons returning a typed array for `blocks` whose element stream can contain:
-                    // - marker-based blobs:     [0x0a|0x0b|0xba|0xcf][varint_len][payload...]
-                    // - markerless blobs:      [varint_len][payload...]
-                    // - (rare) object payload: [field_count varint][field_name...][value...]
-                    //
-                    // We therefore sniff each element and decode using the first strategy which validates bounds.
-
-                    // A) Marker-based blob
-                    let mut blob_payload: Option<Vec<u8>> = None;
-
-                    if is_supported_blob_marker(reader_blob[0]) {
-                        let marker = reader_blob[0];
-
-                        if reader_blob.len() < 2 {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF after blob marker")
+                    // Each element is just a length-prefixed byte array: [varint_len][payload...]
+                    if let Some((len_u64, used)) = peek_epee_varint_u64(reader_blob) {
+                        let len_usize = usize::try_from(len_u64).map_err(|_| {
+                            cuprate_epee_encoding::error::Error::Format(Box::leak(
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] length overflow ({len_u64})")
                                     .into_boxed_str(),
-                            )));
-                        }
-
-                        let (len_u64, len_varint_bytes) = match peek_epee_varint_u64(
-                            &reader_blob[1..],
-                        ) {
-                            Some((len, used)) => (len, used),
-                            None => {
-                                return Err(cuprate_epee_encoding::error::Error::Format(
-                                        Box::leak(
-                                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length after blob marker")
-                                                .into_boxed_str(),
-                                        ),
-                                    ));
-                            }
-                        };
-
-                        if bulk_bin_debug_enabled() {
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: blob-decode header(mode=marker) marker=0x{:02x} len_u64={} varint_bytes={}",
-                                i,
-                                marker,
-                                len_u64,
-                                len_varint_bytes
-                            );
-                        }
-
-                        let len_usize = match usize::try_from(len_u64) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                    format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] length overflow ({len_u64})")
-                                        .into_boxed_str(),
-                                )));
-                            }
-                        };
+                            ))
+                        })?;
 
                         if len_usize > MAX_BLOCK_BYTES {
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
@@ -2081,186 +2046,61 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
 
                         let rem = reader_blob.len();
-                        let overhead = 1 + len_varint_bytes; // marker + varint
-                        if rem < overhead + len_usize {
+                        if rem < used + len_usize {
                             return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element length out of bounds (len={len_usize}, overhead={overhead}, remaining={rem})")
+                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] element length out of bounds (len={len_usize}, overhead={used}, remaining={rem})")
                                     .into_boxed_str(),
                             )));
                         }
-
-                        // Consume marker and then read the length-prefixed bytes.
-                        reader_blob = &reader_blob[1..];
-                        let payload = read_epee_len_prefixed_bytes(
-                            &mut reader_blob,
-                            "getblocks.bin blocks(blob_payload/marker)",
-                        )?;
-                        blob_payload = Some(payload);
                     } else {
-                        // B) Markerless blob: [varint_len][payload]
-                        // Only accept this interpretation if the varint and bounds are sane.
-                        if let Some((len_u64, used)) = peek_epee_varint_u64(reader_blob) {
-                            let len_usize = match usize::try_from(len_u64) {
-                                Ok(v) => v,
-                                Err(_) => usize::MAX,
-                            };
-
-                            let rem = reader_blob.len();
-                            let overhead = used;
-                            let markerless_ok = len_usize != usize::MAX
-                                && len_usize <= MAX_BLOCK_BYTES
-                                && overhead <= rem
-                                && rem >= overhead + len_usize;
-
-                            if bulk_bin_debug_enabled() {
-                                println!(
-                                    "🧩 getblocks.bin blocks[{}]: blob-decode sniff(mode=markerless) first=0x{:02x} len_u64={} varint_bytes={} ok={}",
-                                    i,
-                                    reader_blob[0],
-                                    len_u64,
-                                    used,
-                                    markerless_ok
-                                );
-                            }
-
-                            if markerless_ok {
-                                let payload = read_epee_len_prefixed_bytes(
-                                    &mut reader_blob,
-                                    "getblocks.bin blocks(blob_payload/markerless)",
-                                )?;
-                                blob_payload = Some(payload);
-                            }
-                        }
-                    }
-
-                    // C) If we got a blob payload, optionally inner-decode it as a `block_complete_entry` object.
-                    if let Some(blob_payload) = blob_payload {
-                        if bulk_bin_debug_enabled() {
-                            println!(
-                                "🧩 getblocks.bin blocks[{}]: blob-decode ok (payload_len={})",
-                                i,
-                                blob_payload.len()
-                            );
-                            if !blob_payload.is_empty() {
-                                let hex = hex_dump_prefix(&blob_payload, 32);
-                                println!(
-                                    "🧩 getblocks.bin blocks[{}]: blob payload peek bytes[0..{}]={}",
-                                    i,
-                                    std::cmp::min(32, blob_payload.len()),
-                                    hex
-                                );
-                            }
-                        }
-
-                        if let Some(entry) =
-                            try_decode_block_complete_entry_from_blob_payload(&blob_payload)?
-                        {
-                            if bulk_bin_debug_enabled() {
-                                println!(
-                                    "🧩 getblocks.bin blocks[{}]: inner object-decode from blob payload ok (block_bytes={} tx_blobs={} pruned={})",
-                                    i,
-                                    entry.block.len(),
-                                    entry.txs.len(),
-                                    entry.pruned
-                                );
-                            }
-                            out.push(entry);
-                        } else {
-                            out.push(BlockCompleteEntry {
-                                block: blob_payload,
-                                txs: Vec::new(),
-                                pruned: true,
-                            });
-                        }
-
-                        continue;
-                    }
-
-                    // D) Last resort: try decoding the element stream as a `block_complete_entry` object payload directly.
-                    // We only accept this if it fully parses and produces a non-empty `block` field.
-                    let save_elem = reader_blob;
-                    let mut tmp_r: &[u8] = save_elem;
-
-                    let fields = match skip_epee_varint_u64(&mut tmp_r) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] unable to parse element as blob (marker/markerless) or object (field_count)")
-                                    .into_boxed_str(),
-                            )));
-                        }
-                    };
-
-                    if fields > 1000 {
                         return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object field_count too large ({fields})")
+                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] invalid varint length (shared marker)")
                                 .into_boxed_str(),
                         )));
                     }
 
-                    let mut builder = BlockCompleteEntryBuilder::default();
-                    for _ in 0..fields {
-                        let name = read_epee_field_name(&mut tmp_r).map_err(|e| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object decode failed reading field name: {e}")
-                                    .into_boxed_str(),
-                            ))
-                        })?;
-
-                        let consumed = <BlockCompleteEntryBuilder as cuprate_epee_encoding::EpeeObjectBuilder<
-                            BlockCompleteEntry,
-                        >>::add_field(&mut builder, &name, &mut tmp_r)
-                        .map_err(|e| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object add_field({name:?}) failed: {e}")
-                                    .into_boxed_str(),
-                            ))
-                        })?;
-
-                        if !consumed {
-                            if !tmp_r.has_remaining() {
-                                return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                    format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object unknown field {name:?} with missing marker")
-                                        .into_boxed_str(),
-                                )));
-                            }
-                            let marker = tmp_r.get_u8();
-                            skip_epee_value_with_known_marker(&mut tmp_r, marker)?;
-                        }
-                    }
-
-                    let entry = <BlockCompleteEntryBuilder as cuprate_epee_encoding::EpeeObjectBuilder<
-                        BlockCompleteEntry,
-                    >>::finish(builder)
-                    .map_err(|e| {
-                        cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object finish failed: {e}")
-                                .into_boxed_str(),
-                        ))
-                    })?;
-
-                    if entry.block.is_empty() {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'blocks': blocks[{i}] object decode produced empty block field")
-                                .into_boxed_str(),
-                        )));
-                    }
-
-                    // Commit consumption into the blob reader by advancing by the bytes consumed in tmp_r.
-                    let consumed = save_elem.len().saturating_sub(tmp_r.len());
-                    reader_blob = &reader_blob[consumed..];
+                    let blob_payload = read_epee_len_prefixed_bytes(
+                        &mut reader_blob,
+                        "getblocks.bin blocks(blob_payload/shared_marker)",
+                    )?;
 
                     if bulk_bin_debug_enabled() {
                         println!(
-                            "🧩 getblocks.bin blocks[{}]: object-decode (direct) ok (block_bytes={} tx_blobs={} pruned={})",
+                            "🧩 getblocks.bin blocks[{}]: blob-decode ok (payload_len={})",
                             i,
-                            entry.block.len(),
-                            entry.txs.len(),
-                            entry.pruned
+                            blob_payload.len()
                         );
+                        if !blob_payload.is_empty() {
+                            let hex = hex_dump_prefix(&blob_payload, 32);
+                            println!(
+                                "🧩 getblocks.bin blocks[{}]: blob payload peek bytes[0..{}]={}",
+                                i,
+                                std::cmp::min(32, blob_payload.len()),
+                                hex
+                            );
+                        }
                     }
 
-                    out.push(entry);
+                    if let Some(entry) =
+                        try_decode_block_complete_entry_from_blob_payload(&blob_payload)?
+                    {
+                        if bulk_bin_debug_enabled() {
+                            println!(
+                                "🧩 getblocks.bin blocks[{}]: inner object-decode from blob payload ok (block_bytes={} tx_blobs={} pruned={})",
+                                i,
+                                entry.block.len(),
+                                entry.txs.len(),
+                                entry.pruned
+                            );
+                        }
+                        out.push(entry);
+                    } else {
+                        out.push(BlockCompleteEntry {
+                            block: blob_payload,
+                            txs: Vec::new(),
+                            pruned: true,
+                        });
+                    }
                 }
 
                 // Commit consumption: advance the original Buf by the bytes we consumed in the temp reader.
