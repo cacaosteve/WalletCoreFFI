@@ -34,20 +34,15 @@ fn build_stamp() -> &'static str {
     option_env!("WALLETCORE_BUILD_STAMP").unwrap_or("unknown")
 }
 
-// Debug-only switch to test daemon behavior differences for `get_blocks_fast` request encoding.
-// Some daemons appear to change the response shape depending on whether `block_ids` is encoded as:
-// - packed blob (wallet2-style KV_SERIALIZE_CONTAINER_POD_AS_BLOB), or
-// - a normal EPEE array of 32-byte blobs.
+// `block_ids` encoding for wallet2-fast is fixed by the Monero daemon RPC schema:
 //
-// Env:
-// - WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING=blob   (default)
-// - WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING=array
-fn getblocks_blockids_encoding_from_env() -> String {
-    std::env::var("WALLETCORE_GETBLOCKS_BLOCKIDS_ENCODING")
-        .ok()
-        .unwrap_or_else(|| "blob".to_string())
-        .to_lowercase()
-}
+//   KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids)
+//
+// i.e. a single packed blob of 32-byte hashes.
+//
+// We intentionally do not support alternative encodings here. If a daemon returns an unexpected
+// response variant, we handle that via strategy fallback (e.g., range bulk) rather than trying
+// non-spec request encodings.
 
 fn bulk_mode_str(mode: BulkFetchMode) -> &'static str {
     match mode {
@@ -2912,69 +2907,41 @@ impl BlockingRpcTransport {
         prune: bool,
     ) -> Result<GetBlocksFastBinResponse, RpcError> {
         // Match COMMAND_RPC_GET_BLOCKS_FAST::request_t defaults:
-        // requested_info defaults to 0 (BLOCKS_ONLY),
-        // no_miner_tx defaults to false,
-        // pool_info_since defaults to 0,
-        // max_block_count defaults to 0.
+        // - requested_info defaults to 0 (BLOCKS_ONLY)
+        // - no_miner_tx defaults to false
+        // - pool_info_since defaults to 0
+        // - max_block_count defaults to 0
         //
-        // IMPORTANT:
-        // - Wallet2 encodes `block_ids` as KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids) (packed 32*N bytes).
-        // - However, some daemons appear to return different response variants depending on how `block_ids`
-        //   is encoded. We allow a debug override to test "array" encoding.
-        let encoding = getblocks_blockids_encoding_from_env();
-
-        // Always compute the packed blob (used in "blob" mode and for logging)
+        // Wallet2-style: `block_ids` is KV_SERIALIZE_CONTAINER_POD_AS_BLOB(block_ids),
+        // i.e. a single packed blob of 32-byte hashes.
         let mut block_ids_blob: Vec<u8> = Vec::with_capacity(block_ids.len().saturating_mul(32));
         for h in &block_ids {
             block_ids_blob.extend_from_slice(h);
         }
 
-        // Make the request more explicit in debug mode to encourage daemons to return block entries
-        // rather than a packed hash-list variant in `blocks`.
-        let (requested_info, max_block_count) = if bulk_bin_debug_enabled() {
-            // Empirical: try a "stronger" requested_info and a non-zero max_block_count.
-            // We can iterate on requested_info values based on daemon behavior.
-            (1u8, block_ids.len() as u64)
-        } else {
-            (0u8, 0u64)
-        };
+        // Wallet2-aligned defaults:
+        //
+        // - requested_info=BLOCKS_ONLY (0). This controls blocks vs pool inclusion and does NOT influence
+        //   the block encoding variant in a reliable way.
+        // - max_block_count: request a bounded number of blocks per call. Use the walletcore bulk batch as
+        //   the effective limit (default 200) so performance tuning is centralized.
+        let requested_info: u8 = 0;
+        let max_block_count: u64 = bulk_fetch_batch_from_env() as u64;
 
         if bulk_bin_debug_enabled() {
             println!(
-                "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={} block_ids_encoding={}",
+                "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={}",
                 requested_info,
                 start_height,
                 prune,
                 max_block_count,
-                block_ids_blob.len(),
-                encoding
+                block_ids_blob.len()
             );
         }
 
         let req = GetBlocksFastBinRequest {
             requested_info,
-            block_ids: if encoding == "array" {
-                // Encode as an EPEE array of 32-byte blobs.
-                // This is NOT wallet2-default behavior; it is a compatibility probe.
-                //
-                // We serialize by building a portable_storage object where block_ids is a normal array value.
-                // Since `GetBlocksFastBinRequest` currently models `block_ids` as `Vec<u8>` (blob), we instead
-                // fall back to the blob field holding the concatenation in "blob" mode only.
-                //
-                // For "array" mode we pack into the existing field but prefix with a marker that is impossible
-                // for a real packed hash list (so we can detect misuse). The daemon should reject if it truly
-                // expects a blob; that's useful signal during debugging.
-                //
-                // NOTE: This is intentionally conservative: a proper array-mode implementation should introduce
-                // a separate request type. For now we keep the toggle minimal and observable.
-                let mut v = Vec::with_capacity(1 + block_ids_blob.len());
-                v.push(0xff);
-                v.extend_from_slice(&block_ids_blob);
-                v
-            } else {
-                // Default: wallet2-style packed blob
-                block_ids_blob
-            },
+            block_ids: block_ids_blob,
             start_height,
             prune,
             no_miner_tx: false,
@@ -4192,7 +4159,13 @@ pub extern "C" fn wallet_refresh(
     // (moved above) WALLETCORE_WORKER_BLOCKS is now configured alongside WALLETCORE_BULK_RPC.
 
     if scan_cursor < daemon.height {
-        if par > 1 && batch > 1 {
+        // NOTE: We intentionally disable parallel bulk scanning for now to keep refresh behavior deterministic
+        // while focusing on wallet2-style fast sync debugging (get_blocks_fast / get_blocks.bin).
+        //
+        // Parallel mode previously caused early-abort behavior on decode errors, making it harder to iterate
+        // on the wallet2-fast path. We will reintroduce parallelism after the wallet2-fast response decoding
+        // is stable across daemon variants.
+        if false && par > 1 && batch > 1 {
             // Parallel, batched scanning. Each worker uses its own Scanner cloned from the same view_pair.
             //
             // Bulk fetch is default-enabled but clearnet-only (node_url must be provided). For I2P scans we
