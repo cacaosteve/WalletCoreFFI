@@ -30,6 +30,18 @@ This README explains how to consume the package on Apple platforms, how Linux li
 - Send / sweep via **prepare → durable local persist → relay** (apps recover pending prepares across relaunch)
 - Secret hygiene: in-memory keys (not a long-lived mnemonic string); KI/amount diagnostic dumps are env-gated
 
+### Security defaults
+
+Custom daemon HTTP reads are bounded before JSON/EPEE decoding: 16 MiB for JSON,
+64 MiB for binary responses on iOS/Android, and 128 MiB on desktop. Chunked bodies
+are bounded too; exceeding the limit returns an error, never a truncated success.
+
+Sensitive core console/file logging is disabled in standard builds. Development
+diagnostics require **both** the `diagnostic-logging` Cargo feature and
+`WALLETCORE_DIAGNOSTICS=1`. Do not enable this feature in distributed artifacts or
+share diagnostic logs from real wallets. Explicit benchmark RPC timing telemetry
+remains separate and opt-in.
+
 
 ## Supported platforms
 

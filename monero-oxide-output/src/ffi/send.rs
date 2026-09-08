@@ -7,6 +7,7 @@
 #![allow(clippy::needless_return)]
 
 use crate::support::*;
+use crate::StoredWallet;
 
 use core::ffi::c_char;
 use rand::{rngs::OsRng, RngCore};
@@ -178,6 +179,19 @@ struct PreparedSendPayload {
     amount: u64,
     fee: u64,
     signed_tx_hex: String,
+    #[serde(default)]
+    wallet_binding: Option<String>,
+}
+
+fn validate_prepared_binding(
+    prepared: &PreparedSendPayload,
+    wallet: &StoredWallet,
+) -> Result<(), &'static str> {
+    match prepared.wallet_binding.as_deref() {
+        Some(binding) if binding == wallet_cache_binding(wallet) => Ok(()),
+        Some(_) => Err("pending transaction belongs to another wallet or network; recovery data retained"),
+        None => Err("legacy pending transaction lacks wallet identity; explicit recovery is required; recovery data retained"),
+    }
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
@@ -309,6 +323,19 @@ fn wallet_relay_prepared_impl(
             return ptr::null_mut();
         }
     };
+    // This runs before blob decoding or ANY RPC. The refresh registry lock also excludes
+    // wallet replacement for the entire relay, so validation and local application agree.
+    let binding_result = {
+        let store = WALLET_STORE.lock().expect("wallet store poisoned");
+        store
+            .get(id)
+            .ok_or("wallet not opened")
+            .and_then(|wallet| validate_prepared_binding(&prepared, wallet))
+    };
+    if let Err(error) = binding_result {
+        record_error(-10, format!("wallet_relay_prepared: {error}"));
+        return ptr::null_mut();
+    }
     let tx_bytes = match decode_hex(&prepared.signed_tx_hex) {
         Ok(value) => value,
         Err(error) => {
@@ -1296,6 +1323,7 @@ fn wallet_send_impl(
                 "txid": txid,
                 "amount": amount_piconero,
                 "fee": fee_piconero,
+                "wallet_binding": wallet_cache_binding(&snapshot),
                 "signed_tx_hex": hex_lowercase(&tx_blob)
             })) {
                 Ok(s) => s,
@@ -2895,6 +2923,7 @@ fn wallet_send_with_filter_impl(
             "txid": txid,
             "amount": total_needed,
             "fee": fee_piconero,
+            "wallet_binding": wallet_cache_binding(&snapshot),
             "signed_tx_hex": hex_lowercase(&tx_blob)
         })) {
             Ok(s) => s,
@@ -3130,6 +3159,65 @@ fn wallet_send_with_filter_impl(
 #[cfg(test)]
 mod tests {
     use super::decode_hex;
+
+    #[test]
+    fn pending_send_binding_rejects_legacy_foreign_and_network_replacement() {
+        use super::*;
+        let id = CString::new("prepared-binding-fixture").unwrap();
+        let seed = CString::new("ability pockets lordship tomorrow gypsy match neutral uncle avatar betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring paradise psychic betting").unwrap();
+        assert_eq!(
+            crate::wallet_open_from_mnemonic(id.as_ptr(), seed.as_ptr(), 100, 1),
+            0
+        );
+        let mut store = WALLET_STORE.lock().unwrap();
+        let wallet = store.get_mut("prepared-binding-fixture").unwrap();
+        let mut prepared = PreparedSendPayload {
+            txid: "fixture".into(),
+            amount: 1,
+            fee: 1,
+            signed_tx_hex: "00".into(),
+            wallet_binding: Some(wallet_cache_binding(wallet)),
+        };
+        assert!(validate_prepared_binding(&prepared, wallet).is_ok());
+        let binding = prepared.wallet_binding.clone();
+        prepared.wallet_binding = None;
+        assert!(validate_prepared_binding(&prepared, wallet).is_err());
+        prepared.wallet_binding = Some("another wallet".into());
+        assert!(validate_prepared_binding(&prepared, wallet).is_err());
+        prepared.wallet_binding = binding;
+        wallet.network = crate::MoneroNetwork::Stagenet;
+        assert!(validate_prepared_binding(&prepared, wallet).is_err());
+        store.remove("prepared-binding-fixture");
+    }
+
+    #[test]
+    fn native_relay_rejects_unbound_journals_before_blob_or_network_work() {
+        use super::*;
+        let id = CString::new("prepared-binding-native-fixture").unwrap();
+        let seed = CString::new("ability pockets lordship tomorrow gypsy match neutral uncle avatar betting bicycle junk unzip pyramid lynx mammal edgy empty uneven knowledge juvenile wiring paradise psychic betting").unwrap();
+        assert_eq!(
+            crate::wallet_open_from_mnemonic(id.as_ptr(), seed.as_ptr(), 100, 1),
+            0
+        );
+        let node = CString::new("not-a-node-url").unwrap();
+        for (binding, expected) in [
+            (None, "lacks wallet identity"),
+            (Some("foreign"), "another wallet or network"),
+        ] {
+            let mut payload = serde_json::json!({"txid":"fixture", "amount":1, "fee":1, "signed_tx_hex":"not-hex"});
+            if let Some(value) = binding {
+                payload["wallet_binding"] = value.into();
+            }
+            let payload = CString::new(payload.to_string()).unwrap();
+            assert!(wallet_relay_prepared(id.as_ptr(), node.as_ptr(), payload.as_ptr()).is_null());
+            // Neither malformed signed bytes nor an invalid endpoint may be consulted first.
+            assert!(crate::last_error_clone().unwrap().contains(expected));
+        }
+        WALLET_STORE
+            .lock()
+            .unwrap()
+            .remove("prepared-binding-native-fixture");
+    }
 
     #[test]
     fn decode_hex_accepts_mixed_case() {

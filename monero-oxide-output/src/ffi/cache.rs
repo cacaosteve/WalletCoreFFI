@@ -13,6 +13,7 @@ Exposes:
 
 use crate::support::*;
 
+use bincode::Options;
 use core::ffi::{c_char, c_int};
 use core::{ptr, slice};
 use std::ffi::CStr;
@@ -21,6 +22,16 @@ use std::ffi::CStr;
 // Bump this when the persisted cache format OR the semantics of persisted fields change
 // in a way that makes old caches unsafe to import (e.g. key image derivation changes).
 const WALLETCORE_CACHE_VERSION: u32 = 3;
+// Shared with host file readers. Bound both wire bytes and decoder work before allocating.
+pub const MAX_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+fn decode_cache(data: &[u8]) -> bincode::Result<PersistedWallet> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding() // Preserve the existing bincode::serialize wire format.
+        .with_limit(MAX_CACHE_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(data)
+}
 
 #[no_mangle]
 pub extern "C" fn wallet_import_cache(
@@ -33,6 +44,9 @@ pub extern "C" fn wallet_import_cache(
     if wallet_id.is_null() || cache_ptr.is_null() || cache_len == 0 {
         return record_error(-11, "wallet_import_cache: invalid arguments");
     }
+    if cache_len as u64 > MAX_CACHE_BYTES {
+        return record_error(-16, "wallet_import_cache: cache exceeds 128 MiB limit");
+    }
 
     let id = match unsafe { CStr::from_ptr(wallet_id) }.to_str() {
         Ok(s) => s.trim(),
@@ -41,7 +55,7 @@ pub extern "C" fn wallet_import_cache(
 
     let data = unsafe { slice::from_raw_parts(cache_ptr, cache_len) };
 
-    let persisted: PersistedWallet = match bincode::deserialize(data) {
+    let persisted: PersistedWallet = match decode_cache(data) {
         Ok(p) => p,
         Err(err) => {
             return record_error(
@@ -167,6 +181,18 @@ pub extern "C" fn wallet_export_cache(
     };
 
     let persisted = PersistedWallet::from(state);
+    drop(map); // Serialize the coherent snapshot without blocking scanning/UI reads.
+
+    let required = match bincode::serialized_size(&persisted) {
+        Ok(size) if size <= MAX_CACHE_BYTES => size as usize,
+        _ => return record_error(-16, "wallet_export_cache: cache exceeds 128 MiB limit"),
+    };
+    if out_buf.is_null() || out_buf_len < required {
+        if !out_written.is_null() {
+            unsafe { *out_written = required };
+        }
+        return -12;
+    }
 
     let bytes = match bincode::serialize(&persisted) {
         Ok(b) => b,
@@ -177,29 +203,6 @@ pub extern "C" fn wallet_export_cache(
             )
         }
     };
-
-    // Size-query mode: caller provides null buffer to query required size.
-    if out_buf.is_null() {
-        if !out_written.is_null() {
-            unsafe { *out_written = bytes.len() };
-        }
-        return -12;
-    }
-
-    // Buffer too small.
-    if bytes.len() > out_buf_len {
-        if !out_written.is_null() {
-            unsafe { *out_written = bytes.len() };
-        }
-        return record_error(
-            -12,
-            format!(
-                "wallet_export_cache: buffer too small (need {}, have {})",
-                bytes.len(),
-                out_buf_len
-            ),
-        );
-    }
 
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
@@ -218,6 +221,104 @@ mod tests {
     use crate::support::WALLET_STORE;
     use crate::PersistedNetwork;
     use std::ffi::CString;
+
+    #[test]
+    fn cache_budget_rejects_oversized_input_and_forged_lengths() {
+        let id = CString::new("cache-limit-fixture").unwrap();
+        // Deliberately only one real byte: the size gate must return before making a slice.
+        let byte = 0u8;
+        assert_ne!(
+            wallet_import_cache(id.as_ptr(), &byte, MAX_CACHE_BYTES as usize + 1),
+            0
+        );
+        let mut hostile = 3u32.to_le_bytes().to_vec();
+        hostile.extend_from_slice(&u64::MAX.to_le_bytes()); // primary-address string length
+        assert!(decode_cache(&hostile).is_err());
+    }
+
+    #[test]
+    fn cache_decoder_accepts_existing_format_but_not_trailing_bytes() {
+        let id = "cache-bounded-roundtrip";
+        open_wallet(id);
+        let mut bytes = export_bytes(id);
+        assert!(decode_cache(&bytes).is_ok());
+        bytes.push(0);
+        assert!(decode_cache(&bytes).is_err());
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
+
+    #[test]
+    #[ignore = "synthetic 100k-output memory/scale diagnostic; no wallet or RPC required"]
+    fn synthetic_large_wallet_cache_and_paging() {
+        use crate::TrackedOutput;
+        let count = 100_000usize;
+        let id = "cache-synthetic-scale";
+        open_wallet(id);
+        {
+            let mut store = WALLET_STORE.lock().unwrap();
+            let wallet = store.get_mut(id).unwrap();
+            wallet.chain_height = count as u64 + 1000;
+            wallet.last_scanned = wallet.chain_height;
+            wallet.tracked_outputs = (0..count)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    TrackedOutput {
+                        tx_hash: hash,
+                        index_in_tx: 0,
+                        key_image: hash,
+                        amount: 1,
+                        block_height: i as u64 + 1,
+                        additional_timelock: crate::Timelock::None,
+                        is_coinbase: false,
+                        subaddress_major: 0,
+                        subaddress_minor: 0,
+                        spent: false,
+                        spending_txid: None,
+                        spending_height: None,
+                    }
+                })
+                .collect();
+        }
+        let bytes = export_bytes(id);
+        let id_c = CString::new(id).unwrap();
+        assert_eq!(
+            wallet_import_cache(id_c.as_ptr(), bytes.as_ptr(), bytes.len()),
+            0
+        );
+        // Import reconstructs the complete transaction ledger. Measure and round-trip
+        // that realistic snapshot too, not just the raw synthetic output records.
+        let full_bytes = export_bytes(id);
+        assert!(full_bytes.len() > bytes.len());
+        drop(bytes);
+        assert_eq!(
+            wallet_import_cache(id_c.as_ptr(), full_bytes.as_ptr(), full_bytes.len()),
+            0
+        );
+        use crate::ffi::history::{query_history, HistoryQuery};
+        let first = query_history(id, &HistoryQuery::default()).unwrap();
+        assert_eq!(first.total_count, count);
+        for offset in [0, 50_000, 99_950] {
+            let page = query_history(
+                id,
+                &HistoryQuery {
+                    offset,
+                    revision: Some(first.revision.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(page.transfers.len(), 50);
+        }
+        let store = WALLET_STORE.lock().unwrap();
+        assert_eq!(store[id].total, count as u64);
+        drop(store);
+        println!(
+            "synthetic_outputs={count} cache_bytes={} page_rows=50",
+            full_bytes.len()
+        );
+        WALLET_STORE.lock().unwrap().remove(id);
+    }
 
     const TEST_MNEMONIC: &str =
         "ability pockets lordship tomorrow gypsy match neutral uncle avatar \

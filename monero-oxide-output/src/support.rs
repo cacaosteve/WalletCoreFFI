@@ -17,6 +17,7 @@ pub(crate) mod bulk_models;
 pub(crate) mod key_image;
 pub(crate) mod reexports;
 pub(crate) mod rpc;
+pub(crate) mod response_limits;
 
 pub(crate) use bulk_bin::*;
 // NOTE: do not glob-reexport `bulk_models::*` from the support facade.

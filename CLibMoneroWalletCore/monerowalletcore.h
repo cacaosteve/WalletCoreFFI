@@ -261,6 +261,8 @@ char* wallet_export_outputs_json(
  * Consumers should reject unknown schema versions, ignore additive fields in a
  * supported version, and may accept the historical bare transfer array as v0.
  */
+// Additive local history query API. Free result with walletcore_free_cstr.
+char* wallet_query_transfers_json(const char* wallet_id, const char* query_json);
 char* wallet_list_transfers_json(
     const char* wallet_id
 );

@@ -21,12 +21,15 @@ public extension WalletCoreFFIClient {
         public let amount: UInt64
         public let fee: UInt64
         public let signedTxHex: String
+        /// Primary address, including network. Nil legacy journals are never auto-relayed.
+        public let walletBinding: String?
 
         private enum CodingKeys: String, CodingKey {
             case txid
             case amount
             case fee
             case signedTxHex = "signed_tx_hex"
+            case walletBinding = "wallet_binding"
         }
     }
 
@@ -39,7 +42,7 @@ public extension WalletCoreFFIClient {
         public let fee: UInt64
     }
 
-    struct Transfer: Decodable, Equatable {
+    struct Transfer: Decodable, Equatable, Sendable {
         public let txid: String
         public let direction: String
         public let amount: UInt64

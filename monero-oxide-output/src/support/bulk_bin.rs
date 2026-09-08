@@ -170,14 +170,12 @@ pub(crate) fn read_epee_field_name<B: Buf>(
 /// `ctx` is included in any error messages for easier debugging.
 pub(crate) fn read_epee_len_prefixed_bytes<B: Buf>(
     r: &mut B,
-    ctx: &'static str,
+    _ctx: &'static str,
     max_len: usize,
 ) -> cuprate_epee_encoding::error::Result<Vec<u8>> {
     let len = skip_epee_varint_u64(r)?;
     let len_usize = usize::try_from(len).map_err(|_| {
-        cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("{ctx}: length overflow").into_boxed_str(),
-        ))
+        cuprate_epee_encoding::error::Error::Format("EPEE byte sequence length overflow")
     })?;
 
     if len_usize > max_len {
@@ -187,9 +185,9 @@ pub(crate) fn read_epee_len_prefixed_bytes<B: Buf>(
     }
 
     if r.remaining() < len_usize {
-        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("{ctx}: EOF reading bytes").into_boxed_str(),
-        )));
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "EPEE byte sequence truncated",
+        ));
     }
 
     Ok(r.copy_to_bytes(len_usize).to_vec())
@@ -218,6 +216,18 @@ pub(crate) fn is_supported_blob_marker(marker: u8) -> bool {
 // If we encounter an unsupported marker, we return a Format error so we can extend support safely.
 
 pub(crate) fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error::Result<()> {
+    let mut budget = MAX_EPEE_SKIP_VALUES;
+    skip_epee_value_bounded(r, 0, &mut budget)
+}
+
+const MAX_EPEE_NESTING: usize = 64;
+const MAX_EPEE_SKIP_VALUES: usize = 1_000_000;
+
+fn skip_epee_value_bounded<B: Buf>(
+    r: &mut B,
+    depth: usize,
+    remaining_values: &mut usize,
+) -> cuprate_epee_encoding::error::Result<()> {
     if !r.has_remaining() {
         return Err(cuprate_epee_encoding::error::Error::Format(
             "skip_epee_value: unexpected EOF (no marker)",
@@ -225,18 +235,39 @@ pub(crate) fn skip_epee_value<B: Buf>(r: &mut B) -> cuprate_epee_encoding::error
     }
 
     let marker = r.get_u8();
-    skip_epee_value_with_known_marker(r, marker)
+    skip_epee_value_with_budget(r, marker, depth, remaining_values)
 }
 
 pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
     r: &mut B,
     marker: u8,
 ) -> cuprate_epee_encoding::error::Result<()> {
+    let mut budget = MAX_EPEE_SKIP_VALUES;
+    skip_epee_value_with_budget(r, marker, 0, &mut budget)
+}
+
+fn skip_epee_value_with_budget<B: Buf>(
+    r: &mut B,
+    marker: u8,
+    depth: usize,
+    remaining_values: &mut usize,
+) -> cuprate_epee_encoding::error::Result<()> {
+    if depth >= MAX_EPEE_NESTING || *remaining_values == 0 {
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "EPEE nesting/work limit exceeded",
+        ));
+    }
+    *remaining_values -= 1;
     if marker & 0x80 != 0 {
         let element_marker = marker & 0x7f;
         let elements = skip_epee_varint_u64(r)?;
+        if elements > *remaining_values as u64 {
+            return Err(cuprate_epee_encoding::error::Error::Format(
+                "EPEE work limit exceeded",
+            ));
+        }
         for _ in 0..elements {
-            skip_epee_value_with_known_marker(r, element_marker)?;
+            skip_epee_value_with_budget(r, element_marker, depth + 1, remaining_values)?;
         }
         return Ok(());
     }
@@ -283,6 +314,11 @@ pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
         // Object: varint field count + repeated (name, marker, value) tuples.
         0x0c => {
             let fields = skip_epee_varint_u64(r)?;
+            if fields > *remaining_values as u64 {
+                return Err(cuprate_epee_encoding::error::Error::Format(
+                    "EPEE work limit exceeded",
+                ));
+            }
             for _ in 0..fields {
                 if r.remaining() < 1 {
                     return Err(cuprate_epee_encoding::error::Error::Format(
@@ -297,15 +333,14 @@ pub(crate) fn skip_epee_value_with_known_marker<B: Buf>(
                 }
                 r.advance(name_len_usize);
 
-                skip_epee_value(r)?;
+                skip_epee_value_bounded(r, depth + 1, remaining_values)?;
             }
             Ok(())
         }
 
-        _ => Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("skip_epee_value_with_known_marker: unsupported marker=0x{marker:02x}")
-                .into_boxed_str(),
-        ))),
+        _ => Err(cuprate_epee_encoding::error::Error::Format(
+            "Unsupported EPEE marker",
+        )),
     }
 }
 
@@ -332,7 +367,7 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
     if bulk_bin_debug_enabled() {
         let chunk0 = r.chunk();
         if !chunk0.is_empty() {
-            println!(
+            walletcore_diagnostic!(
                 "🧩 txs(0x8c) dump@container_start bytes[0..{}]={}",
                 std::cmp::min(64, chunk0.len()),
                 hex_dump_prefix(chunk0, 64)
@@ -348,9 +383,9 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
 
     let marker = r.get_u8();
     if marker != 0x8c {
-        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-            format!("read_txs_typed_array_0x8c: unexpected marker=0x{marker:02x}").into_boxed_str(),
-        )));
+        return Err(cuprate_epee_encoding::error::Error::Format(
+            "Unexpected typed-array EPEE marker",
+        ));
     }
 
     // 1) Element count
@@ -388,7 +423,7 @@ pub(crate) fn read_txs_typed_array_0x8c<B: Buf>(
     if bulk_bin_debug_enabled() {
         let chunk1 = r.chunk();
         if !chunk1.is_empty() {
-            println!(
+            walletcore_diagnostic!(
                 "🧩 txs(0x8c) dump@element_stream_start elem_type={:?} count={} bytes[0..{}]={}",
                 elem_type,
                 n,
@@ -584,6 +619,27 @@ pub(crate) fn try_decode_block_complete_entry_from_blob_payload(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deep_unknown_objects_and_oversized_work_are_rejected() {
+        // Same 400 KB shape that previously aborted the process with stack overflow.
+        let mut nested = Vec::new();
+        for _ in 0..100_000 {
+            nested.extend_from_slice(&[0x0c, 0x04, 1, b'x']);
+        }
+        nested.extend_from_slice(&[0x08, 0]);
+        assert!(super::skip_epee_value(&mut nested.as_slice()).is_err());
+        let mut oversized_array = vec![0x8c];
+        cuprate_epee_encoding::write_varint(super::MAX_EPEE_SKIP_VALUES + 1, &mut oversized_array)
+            .unwrap();
+        assert!(super::skip_epee_value(&mut oversized_array.as_slice()).is_err());
+        let mut shallow = Vec::new();
+        for _ in 0..32 {
+            shallow.extend_from_slice(&[0x0c, 0x04, 1, b'x']);
+        }
+        shallow.extend_from_slice(&[0x08, 0]);
+        assert!(super::skip_epee_value(&mut shallow.as_slice()).is_ok());
+    }
+
     use super::{
         checked_epee_sequence_len, read_epee_len_prefixed_bytes, read_txs_typed_array_0x8c,
         skip_epee_value, MAX_EPEE_BLOB_BYTES, MAX_EPEE_TXS_PER_BLOCK,

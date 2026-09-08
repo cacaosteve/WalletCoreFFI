@@ -1335,6 +1335,7 @@ fn wallet_sweep_with_filter_impl(
             "txid": txid,
             "amount": final_amount,
             "fee": final_fee,
+            "wallet_binding": wallet_cache_binding(&snapshot),
             "signed_tx_hex": hex_lowercase(&tx_blob)
         })) {
             Ok(s) => s,

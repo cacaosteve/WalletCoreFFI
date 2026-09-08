@@ -4,7 +4,6 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     convert::TryInto,
     ffi::{CStr, CString},
-    io::Read,
     os::raw::{c_char, c_int},
     slice,
     sync::{
@@ -28,8 +27,36 @@ use crate::support::bulk_models::{
 // Re-import bulk-bin helpers into the crate root so existing `lib.rs` call sites continue to work
 // while we incrementally extract bulk binary decoding into `src/support/bulk_bin.rs`.
 use crate::support::bulk_bin_debug_enabled;
+use crate::support::response_limits::{read_response, MAX_BINARY_RESPONSE_BYTES, MAX_JSON_RESPONSE_BYTES};
 
 // (moved into the main std::sync import above)
+
+/// Sensitive developer logs require a deliberately opted-in build AND runtime opt-in.
+/// Normal mobile/desktop release artifacts never enable the feature.
+#[cfg(not(feature = "diagnostic-logging"))]
+pub(crate) fn diagnostics_enabled() -> bool {
+    false
+}
+
+#[cfg(feature = "diagnostic-logging")]
+pub(crate) fn diagnostics_enabled() -> bool {
+    static ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        std::env::var("WALLETCORE_DIAGNOSTICS").as_deref() == Ok("1")
+    });
+    *ENABLED
+}
+
+#[test]
+#[cfg(not(feature = "diagnostic-logging"))]
+fn distributed_build_disables_sensitive_diagnostics() {
+    assert!(!diagnostics_enabled());
+}
+
+macro_rules! walletcore_diagnostic {
+    ($($arg:tt)*) => {{
+        if crate::diagnostics_enabled() { std::eprintln!($($arg)*); }
+    }};
+}
 
 pub mod api;
 mod ffi;
@@ -269,7 +296,7 @@ async fn broadcast_send_raw_transaction(
         .await
         .map_err(|err| {
             let s = err.to_string();
-            println!("🧭 send_raw_transaction rpc error: {s}");
+            walletcore_diagnostic!("🧭 send_raw_transaction rpc error: {s}");
             if is_http_client_failed_error(&s) {
                 monero_interface::InterfaceError::InterfaceError(format!(
                     "send_raw_transaction status=Failed {s}"
@@ -286,7 +313,7 @@ async fn broadcast_send_raw_transaction(
     })?;
 
     let status = res.status.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-    println!(
+    walletcore_diagnostic!(
         "🧭 send_raw_transaction daemon status={} reason={}",
         status,
         res.reason.clone().unwrap_or_else(|| "(none)".to_string())
@@ -558,6 +585,7 @@ fn nexawal_cache_log_path(wallet_id: &str, network: MoneroNetwork) -> Option<std
 
 fn append_walletcore_log_line(wallet_id: &str, network: MoneroNetwork, line: &str) {
     use std::io::Write;
+    if !diagnostics_enabled() { return; }
 
     let Some(path) = nexawal_cache_log_path(wallet_id, network) else {
         return;
@@ -690,7 +718,7 @@ pub(crate) fn append_walletcore_range_decode_telemetry(
 /// Prefer calling this from submodules instead of relying on `macro_rules!`
 /// visibility rules.
 pub(crate) fn walletcore_log_line(wallet_id: &str, network: MoneroNetwork, line: &str) {
-    println!("{}", line);
+    walletcore_diagnostic!("{}", line);
     append_walletcore_log_line(wallet_id, network, line);
 }
 
@@ -742,10 +770,10 @@ pub(crate) static PANIC_HOOK_INSTALLED: Lazy<()> = Lazy::new(|| {
         // Avoid allocations as much as possible.
         let thread = std::thread::current();
         let thread_name = thread.name().unwrap_or("<unnamed>");
-        println!("🧨 walletcore panic: thread={}", thread_name);
+        walletcore_diagnostic!("🧨 walletcore panic: thread={}", thread_name);
 
         if let Some(loc) = info.location() {
-            println!(
+            walletcore_diagnostic!(
                 "🧨 walletcore panic location: {}:{}",
                 loc.file(),
                 loc.line()
@@ -753,16 +781,16 @@ pub(crate) static PANIC_HOOK_INSTALLED: Lazy<()> = Lazy::new(|| {
         }
 
         if let Some(msg) = info.payload().downcast_ref::<&str>() {
-            println!("🧨 walletcore panic message: {}", msg);
+            walletcore_diagnostic!("🧨 walletcore panic message: {}", msg);
         } else if let Some(msg) = info.payload().downcast_ref::<String>() {
-            println!("🧨 walletcore panic message: {}", msg);
+            walletcore_diagnostic!("🧨 walletcore panic message: {}", msg);
         } else {
-            println!("🧨 walletcore panic message: <non-string payload>");
+            walletcore_diagnostic!("🧨 walletcore panic message: <non-string payload>");
         }
 
         // If backtraces are enabled, this may print a useful stack trace.
         // (On Apple platforms, make sure RUST_BACKTRACE=1 is set in the host env for the build/run.)
-        println!(
+        walletcore_diagnostic!(
             "🧨 walletcore backtrace:\n{:?}",
             std::backtrace::Backtrace::force_capture()
         );
@@ -1042,7 +1070,7 @@ fn map_ureq_error(route: &str, err: ureq::Error) -> RpcError {
                 .ok()
                 .map(|s| s.chars().take(200).collect::<String>())
                 .unwrap_or_default();
-            println!(
+            walletcore_diagnostic!(
                 "🧭 rpc HTTP status={} {} route={} body_preview={}",
                 code, text, route, body_preview
             );
@@ -1054,7 +1082,7 @@ fn map_ureq_error(route: &str, err: ureq::Error) -> RpcError {
             }
         }
         ureq::Error::Transport(transport) => {
-            println!("🧭 rpc transport error route={} err={}", route, transport);
+            walletcore_diagnostic!("🧭 rpc transport error route={} err={}", route, transport);
             RpcError::InterfaceError(format!("route={route} {transport}"))
         }
     }
@@ -1890,20 +1918,16 @@ impl BlockingRpcTransport {
             .request_for(route)
             .send_bytes(&body)
             .map_err(|err| map_ureq_error(route, err))?;
-        println!("🧭 rpc HTTP status={} route={}", response.status(), route);
-        let mut reader = response.into_reader();
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .map_err(|err| RpcError::InterfaceError(err.to_string()))?;
-        Ok(buf)
+        walletcore_diagnostic!("🧭 rpc HTTP status={} route={}", response.status(), route);
+        read_response(response, MAX_JSON_RESPONSE_BYTES)
+            .map_err(|err| RpcError::InterfaceError(err.to_string()))
     }
 
     fn post_bin(&self, route: &str, body: Vec<u8>) -> Result<Vec<u8>, RpcError> {
         let request_bytes = body.len();
         let started = std::time::Instant::now();
         if bulk_bin_debug_enabled() {
-            println!("🧩 rpc(bin) POST route={}", route);
+            walletcore_diagnostic!("🧩 rpc(bin) POST route={}", route);
         }
         let response = match self.request_for_bin(route).send_bytes(&body) {
             Ok(response) => response,
@@ -1922,10 +1946,10 @@ impl BlockingRpcTransport {
             }
         };
         let status = response.status();
-        println!("🧭 rpc(bin) HTTP status={} route={}", status, route);
-        let mut reader = response.into_reader();
-        let mut buf = Vec::new();
-        if let Err(err) = reader.read_to_end(&mut buf) {
+        walletcore_diagnostic!("🧭 rpc(bin) HTTP status={} route={}", status, route);
+        let buf = match read_response(response, MAX_BINARY_RESPONSE_BYTES) {
+            Ok(buf) => buf,
+            Err(err) => {
             let error = err.to_string();
             append_walletcore_rpc_telemetry(
                 "rpc_bin",
@@ -1937,7 +1961,8 @@ impl BlockingRpcTransport {
                 Some(&error),
             );
             return Err(RpcError::InterfaceError(error));
-        }
+            }
+        };
         append_walletcore_rpc_telemetry(
             "rpc_bin",
             route,
@@ -2044,7 +2069,7 @@ impl BlockingRpcTransport {
         let max_block_count: u64 = bulk_fetch_batch_from_env() as u64;
 
         if bulk_bin_debug_enabled() {
-            println!(
+            walletcore_diagnostic!(
                 "🧩 getblocks.bin request: requested_info={} start_height={} prune={} max_block_count={} block_ids_bytes={}",
                 requested_info,
                 start_height,
@@ -2100,8 +2125,9 @@ impl BlockingRpcTransport {
                 };
                 (-15, format!("json_rpc {method}: {detail}"))
             })?;
-        let value: serde_json::Value = response
-            .into_json()
+        let bytes = read_response(response, MAX_JSON_RESPONSE_BYTES)
+            .map_err(|err| (-15, format!("json_rpc {method}: {err}")))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|err| (-15, format!("json decode for {method}: {err}")))?;
         if let Some(error_obj) = value.get("error") {
             let msg = error_obj

@@ -476,6 +476,7 @@ mod android_log {
 }
 
 fn wc_log_line_android_or_stdout(msg: &str) {
+    if !crate::diagnostics_enabled() { return; }
     #[cfg(target_os = "android")]
     {
         android_log::info(msg);
@@ -483,7 +484,7 @@ fn wc_log_line_android_or_stdout(msg: &str) {
     }
     #[cfg(not(target_os = "android"))]
     {
-        println!("{msg}");
+        walletcore_diagnostic!("{msg}");
     }
 }
 
@@ -666,18 +667,10 @@ fn fetch_output_indexes_via_get_transactions(
     })
     .to_string();
 
-    let response = ureq::post(&format!("{base_url}/get_transactions"))
-        .set("Content-Type", "application/json")
-        .send_string(&body)
-        .map_err(|e| {
-            RpcError::InvalidInterface(format!("get_transactions fallback request failed: {e}"))
-        })?;
-
-    let mut reader = response.into_reader();
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|e| {
-        RpcError::InvalidInterface(format!("get_transactions fallback read failed: {e}"))
-    })?;
+    // Share the bounded reader, timeout and configured proxy with the main scan transport.
+    let bytes = BlockingRpcTransport::new(base_url)
+        .map_err(|_| RpcError::InvalidInterface("invalid fallback node URL".to_string()))?
+        .post_bytes("get_transactions", body.into_bytes())?;
 
     let parsed: GetTransactionsOutputIndicesResponse =
         serde_json::from_slice(&bytes).map_err(|e| {
@@ -3933,7 +3926,7 @@ fn wallet_refresh_impl(
         let new_outputs = working_outputs.len().saturating_sub(initial_outputs);
         if let Some(start) = overall_start {
             let secs = start.elapsed().as_secs_f64();
-            eprintln!(
+            walletcore_diagnostic!(
                 "wallet_refresh: scanned {} blocks; new_outputs={}; elapsed={:.3}s",
                 blocks_scanned, new_outputs, secs
             );
@@ -4267,7 +4260,7 @@ mod tests {
         let parallel_elapsed = parallel_started.elapsed();
 
         assert_eq!(parallel, serial);
-        eprintln!(
+        walletcore_diagnostic!(
             "live scan comparison: blocks={} threads={} serial_ms={} parallel_ms={} speedup={:.2}x",
             blocks.len(),
             threads,
@@ -4496,7 +4489,7 @@ mod tests {
             fetch_scannable_blocks_range_bin(&client, &base_url, 3_630_413, 3_630_437, None)
                 .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
 
-        eprintln!("fetched scannable blocks={}", blocks.len());
+        walletcore_diagnostic!("fetched scannable blocks={}", blocks.len());
         assert_eq!(blocks.len(), 25);
     }
 
@@ -4514,7 +4507,7 @@ mod tests {
             fetch_scannable_blocks_range_bin(&client, base_url, 3_519_450, 3_519_474, None)
                 .unwrap_or_else(|e| panic!("range fetch failed: {e}"));
 
-        eprintln!("fetched iOS-window scannable blocks={}", blocks.len());
+        walletcore_diagnostic!("fetched iOS-window scannable blocks={}", blocks.len());
         assert_eq!(blocks.len(), 25);
     }
 
@@ -4557,7 +4550,7 @@ mod tests {
 
                 std::fs::write("/tmp/get_o_indexes_first_tx.bin", &response)
                     .expect("write sample failed");
-                eprintln!(
+                walletcore_diagnostic!(
                     "get_o_indexes response bytes={} tx_hash={} prefix={}",
                     response.len(),
                     tx_hash_hex,
@@ -4565,7 +4558,7 @@ mod tests {
                 );
             }
             Err(ureq::Error::Status(code, response)) => {
-                eprintln!(
+                walletcore_diagnostic!(
                     "get_o_indexes unavailable status={} tx_hash={} url={}",
                     code,
                     tx_hash_hex,

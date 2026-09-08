@@ -278,7 +278,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
     ) -> cuprate_epee_encoding::error::Result<bool> {
         // Targeted schema debugging for `/getblocks.bin` response decoding.
         if bulk_bin_debug_enabled() {
-            println!("🧩 getblocks.bin response: decoding field={:?}", name);
+            walletcore_diagnostic!("🧩 getblocks.bin response: decoding field={:?}", name);
         }
 
         match name {
@@ -295,7 +295,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             let consumed = save.len().saturating_sub(tmp.len());
                             r.advance(consumed);
                             if bulk_bin_debug_enabled() {
-                                println!(
+                                walletcore_diagnostic!(
                                     "🧩 getblocks.bin blocks: generic decode ok (count={})",
                                     v.len()
                                 );
@@ -305,7 +305,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                         Err(e) => {
                             if bulk_bin_debug_enabled() {
-                                println!(
+                                walletcore_diagnostic!(
                                     "🧩 getblocks.bin blocks: generic decode failed; falling back to manual parser: {}",
                                     e
                                 );
@@ -334,53 +334,29 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         }
                         let elem_marker = r.get_u8();
                         if elem_marker != 0x0c {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!(
-                                    "getblocks.bin decode failed in field 'blocks': unexpected element marker=0x{elem_marker:02x} (expected object marker 0x0c)"
-                                )
-                                .into_boxed_str(),
-                            )));
+                            return Err(cuprate_epee_encoding::error::Error::Format("getblocks.bin decode failed in field 'blocks': unexpected element marker (expected object marker 0x0c)"));
                         }
 
-                        let n = skip_epee_varint_u64(r).map_err(|e| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!(
-                                    "getblocks.bin decode failed in field 'blocks': failed to read array length: {e}"
-                                )
-                                .into_boxed_str(),
-                            ))
-                        })?;
+                        let n = skip_epee_varint_u64(r).map_err(|_| { cuprate_epee_encoding::error::Error::Format("getblocks.bin decode failed in field 'blocks': failed to read array length") })?;
 
                         (n, None)
                     }
 
                     // Sequence of objects: [0x8c][len][object][object]...
                     0x8c => {
-                        let n = skip_epee_varint_u64(r).map_err(|e| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!(
-                                    "getblocks.bin decode failed in field 'blocks': failed to read typed-array length: {e}"
-                                )
-                                .into_boxed_str(),
-                            ))
-                        })?;
+                        let n = skip_epee_varint_u64(r).map_err(|_| { cuprate_epee_encoding::error::Error::Format("getblocks.bin decode failed in field 'blocks': failed to read typed-array length") })?;
 
                         (n, None)
                     }
 
                     _ => {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "getblocks.bin decode failed in field 'blocks': unexpected container marker=0x{container_marker:02x} (expected 0x0d or 0x8c)"
-                            )
-                            .into_boxed_str(),
-                        )));
+                        return Err(cuprate_epee_encoding::error::Error::Format("getblocks.bin decode failed in field 'blocks': unexpected container marker (expected 0x0d or 0x8c)"));
                     }
                 };
 
                 if bulk_bin_debug_enabled() {
                     if typed_elem_type.is_none() {
-                        println!(
+                        walletcore_diagnostic!(
                             "🧩 getblocks.bin blocks container: object_seq marker=0x{container_marker:02x} len={}",
                             n
                         );
@@ -402,14 +378,14 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
 
                 for i in 0..n {
                     if bulk_bin_debug_enabled() {
-                        println!(
+                        walletcore_diagnostic!(
                             "🧩 getblocks.bin blocks[{}]: object-decode start (remaining={})",
                             i,
                             reader_obj.len()
                         );
                         if !reader_obj.is_empty() {
                             let hex = hex_dump_prefix(reader_obj, 32);
-                            println!(
+                            walletcore_diagnostic!(
                                 "🧩 getblocks.bin blocks[{}]: object-decode peek bytes[0..{}]={}",
                                 i,
                                 std::cmp::min(32, reader_obj.len()),
@@ -423,7 +399,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         Err(e) => {
                             object_decode_ok = false;
                             if bulk_bin_debug_enabled() {
-                                println!(
+                                walletcore_diagnostic!(
                                     "🧩 getblocks.bin blocks[{}]: object-decode failed reading field_count: {}",
                                     i, e
                                 );
@@ -439,7 +415,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             Err(e) => {
                                 object_decode_ok = false;
                                 if bulk_bin_debug_enabled() {
-                                    println!(
+                                    walletcore_diagnostic!(
                                         "🧩 getblocks.bin blocks[{}]: object-decode failed reading field name: {}",
                                         i, e
                                     );
@@ -454,7 +430,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                                 if let Err(e) = skip_epee_value(&mut reader_obj) {
                                     object_decode_ok = false;
                                     if bulk_bin_debug_enabled() {
-                                        println!(
+                                        walletcore_diagnostic!(
                                             "🧩 getblocks.bin blocks[{}]: object-decode skip unknown field {:?} failed: {}",
                                             i, name, e
                                         );
@@ -465,7 +441,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                             Err(e) => {
                                 object_decode_ok = false;
                                 if bulk_bin_debug_enabled() {
-                                    println!(
+                                    walletcore_diagnostic!(
                                         "🧩 getblocks.bin blocks[{}]: object-decode add_field({:?}) failed: {}",
                                         i, name, e
                                     );
@@ -484,9 +460,10 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                         Err(e) => {
                             object_decode_ok = false;
                             if bulk_bin_debug_enabled() {
-                                println!(
+                                walletcore_diagnostic!(
                                     "🧩 getblocks.bin blocks[{}]: object-decode finish failed: {}",
-                                    i, e
+                                    i,
+                                    e
                                 );
                             }
                             break;
@@ -494,7 +471,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                     };
 
                     if bulk_bin_debug_enabled() {
-                        println!(
+                        walletcore_diagnostic!(
                             "🧩 getblocks.bin blocks[{}]: object-decode ok (block_bytes={} tx_blobs={} pruned={})",
                             i,
                             entry.block.len(),
@@ -514,7 +491,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 }
 
                 if bulk_bin_debug_enabled() {
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 getblocks.bin blocks: object-decode failed; attempting blob fallback from savepoint (remaining={})",
                         savepoint.len()
                     );
@@ -524,14 +501,9 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
                 let mut reader_blob: &[u8] = savepoint;
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
 
-                for i in 0..n {
+                for _ in 0..n {
                     if reader_blob.is_empty() {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "getblocks.bin decode failed in field 'blocks': blocks[{i}] EOF (missing element bytes)"
-                            )
-                            .into_boxed_str(),
-                        )));
+                        return Err(cuprate_epee_encoding::error::Error::Format("getblocks.bin decode failed in field 'blocks': block entry EOF (missing element bytes)"));
                     }
 
                     if !reader_blob.is_empty() && is_supported_blob_marker(reader_blob[0]) {
@@ -565,67 +537,59 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksFastBinResponse>
             }
 
             "start_height" => {
-                self.start_height = Some(read_epee_value(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'start_height': {e}")
-                            .into_boxed_str(),
-                    ))
+                self.start_height = Some(read_epee_value(r).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'start_height'",
+                    )
                 })?);
             }
             "current_height" => {
-                self.current_height = Some(read_epee_value(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'current_height': {e}")
-                            .into_boxed_str(),
-                    ))
+                self.current_height = Some(read_epee_value(r).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'current_height'",
+                    )
                 })?);
             }
             "output_indices" => {
-                self.output_indices =
-                    Some(
-                        read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
-                            .map_err(|e| {
-                                cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("getblocks.bin decode failed in field 'output_indices': {e}")
-                                .into_boxed_str(),
-                        ))
-                            })?,
-                    );
+                self.output_indices = Some(
+                    read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
+                        .map_err(|_| {
+                            cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'output_indices'",
+                            )
+                        })?,
+                );
             }
             "daemon_time" => {
-                self.daemon_time = Some(read_epee_value(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'daemon_time': {e}")
-                            .into_boxed_str(),
-                    ))
+                self.daemon_time = Some(read_epee_value(r).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'daemon_time'",
+                    )
                 })?);
             }
             "pool_info_extent" => {
-                self.pool_info_extent = Some(read_epee_value(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'pool_info_extent': {e}")
-                            .into_boxed_str(),
-                    ))
+                self.pool_info_extent = Some(read_epee_value(r).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'pool_info_extent'",
+                    )
                 })?);
             }
             "status" => {
                 self.status = Some(
                     read_epee_value_limited(r, epee_limits(0, MAX_EPEE_STATUS_BYTES)).map_err(
-                        |e| {
-                            cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!("getblocks.bin decode failed in field 'status': {e}")
-                                    .into_boxed_str(),
-                            ))
+                        |_| {
+                            cuprate_epee_encoding::error::Error::Format(
+                                "getblocks.bin decode failed in field 'status'",
+                            )
                         },
                     )?,
                 );
             }
             "untrusted" => {
-                self.untrusted = Some(read_epee_value(r).map_err(|e| {
-                    cuprate_epee_encoding::error::Error::Format(Box::leak(
-                        format!("getblocks.bin decode failed in field 'untrusted': {e}")
-                            .into_boxed_str(),
-                    ))
+                self.untrusted = Some(read_epee_value(r).map_err(|_| {
+                    cuprate_epee_encoding::error::Error::Format(
+                        "getblocks.bin decode failed in field 'untrusted'",
+                    )
                 })?);
             }
 
@@ -912,7 +876,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
             "block" => {
                 if bulk_bin_debug_enabled() {
                     let rem_before = r.remaining();
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='block' remaining_before={}",
                         rem_before
                     );
@@ -925,7 +889,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
 
                 if bulk_bin_debug_enabled() {
                     let rem_after = r.remaining();
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='block' remaining_after={}",
                         rem_after
                     );
@@ -947,14 +911,14 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
 
                     if rem_before > 0 && !chunk.is_empty() && chunk[0] == 0x8c {
                         let dump_len = std::cmp::min(16, chunk.len());
-                        println!(
+                        walletcore_diagnostic!(
                             "🧩 get_blocks(.bin) block_complete_entry: field='txs' marker=0x8c leading_bytes[0..{}]={}",
                             dump_len,
                             hex_dump_prefix(&chunk[..dump_len], dump_len)
                         );
                     }
 
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='txs' remaining_before={} next_marker={}",
                         rem_before, peek_marker
                     );
@@ -1050,7 +1014,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         "(eof)".to_string()
                     };
 
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='txs' remaining_after={} next_marker={}",
                         rem_after, peek_marker
                     );
@@ -1060,7 +1024,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
             // Be permissive with common field name variants observed across daemons / implementations.
             "txs_blob" | "txs_blobs" | "txs_bytes" | "txs_byte" | "txs_data" | "transactions" => {
                 if bulk_bin_debug_enabled() {
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field={:?} (normalized to 'txs')",
                         name
                     );
@@ -1085,7 +1049,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         "(eof)".to_string()
                     };
 
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='pruned' remaining_before={} next_marker={}",
                         rem_before, peek_marker
                     );
@@ -1106,7 +1070,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         "(eof)".to_string()
                     };
 
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: field='pruned' remaining_after={} next_marker={}",
                         rem_after, peek_marker
                     );
@@ -1128,7 +1092,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
                         "(eof)".to_string()
                     };
 
-                    println!(
+                    walletcore_diagnostic!(
                         "🧩 get_blocks(.bin) block_complete_entry: skipping unknown field {:?} (next_marker={} remaining_before_skip={})",
                         name, peek_marker, rem_before
                     );
@@ -1150,7 +1114,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<BlockCompleteEntry> for BlockCompl
         let pruned = self.pruned.unwrap_or(false);
 
         if bulk_bin_debug_enabled() {
-            println!(
+            walletcore_diagnostic!(
                 "🧩 get_blocks(.bin) block_complete_entry: decoded block_bytes={} tx_blobs={} pruned={}",
                 block.len(),
                 txs.len(),
@@ -1313,12 +1277,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                         }
                         let elem_marker = r.get_u8();
                         if elem_marker != 0x0c {
-                            return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                                format!(
-                                    "get_blocks.bin decode failed in field 'blocks': unexpected element marker=0x{elem_marker:02x}"
-                                )
-                                .into_boxed_str(),
-                            )));
+                            return Err(cuprate_epee_encoding::error::Error::Format("get_blocks.bin decode failed in field 'blocks': unexpected element marker"));
                         }
                         let n = skip_epee_varint_u64(r)?;
                         (n, None)
@@ -1328,12 +1287,7 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                         (n, None)
                     }
                     _ => {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "get_blocks.bin decode failed in field 'blocks': unexpected container marker=0x{container_marker:02x}"
-                            )
-                            .into_boxed_str(),
-                        )));
+                        return Err(cuprate_epee_encoding::error::Error::Format("get_blocks.bin decode failed in field 'blocks': unexpected container marker"));
                     }
                 };
 
@@ -1406,14 +1360,11 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                 let mut reader_blob: &[u8] = savepoint;
                 let mut out: Vec<BlockCompleteEntry> = Vec::with_capacity(n);
 
-                for i in 0..n {
+                for _ in 0..n {
                     if reader_blob.is_empty() {
-                        return Err(cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!(
-                                "get_blocks.bin decode failed in field 'blocks': blocks[{i}] EOF"
-                            )
-                            .into_boxed_str(),
-                        )));
+                        return Err(cuprate_epee_encoding::error::Error::Format(
+                            "get_blocks.bin decode failed in field 'blocks': block entry EOF",
+                        ));
                     }
 
                     if !reader_blob.is_empty() && is_supported_blob_marker(reader_blob[0]) {
@@ -1445,16 +1396,14 @@ impl cuprate_epee_encoding::EpeeObjectBuilder<GetBlocksBinResponse>
                 return Ok(true);
             }
             "output_indices" => {
-                self.output_indices =
-                    Some(
-                        read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
-                            .map_err(|e| {
-                                cuprate_epee_encoding::error::Error::Format(Box::leak(
-                            format!("get_blocks.bin decode failed in field 'output_indices': {e}")
-                                .into_boxed_str(),
-                        ))
-                            })?,
-                    );
+                self.output_indices = Some(
+                    read_epee_value_limited(r, epee_limits(0, MAX_EPEE_BLOCKS_PER_RESPONSE))
+                        .map_err(|_| {
+                            cuprate_epee_encoding::error::Error::Format(
+                                "get_blocks.bin decode failed in field 'output_indices'",
+                            )
+                        })?,
+                );
             }
             "status" => {
                 self.status = Some(read_epee_value_limited(
@@ -1525,7 +1474,7 @@ mod tests {
         let resp: GetBlocksBinResponse = cuprate_epee_encoding::from_bytes(&mut reader)
             .unwrap_or_else(|e| panic!("response decode failed: {e}"));
 
-        eprintln!(
+        walletcore_diagnostic!(
             "decoded blocks={} trailing={} status={:?} untrusted={:?}",
             resp.blocks.len(),
             reader.len(),
@@ -1535,7 +1484,7 @@ mod tests {
         assert!(!resp.blocks.is_empty(), "expected at least one block");
 
         let first = &resp.blocks[0];
-        eprintln!(
+        walletcore_diagnostic!(
             "first block bytes={} txs={} pruned={}",
             first.block.len(),
             first.txs.len(),
@@ -1545,7 +1494,7 @@ mod tests {
         let mut block_reader: &[u8] = first.block.as_slice();
         let block = MoneroBlock::read(&mut block_reader)
             .unwrap_or_else(|e| panic!("first block decode failed: {e}"));
-        eprintln!(
+        walletcore_diagnostic!(
             "first block tx_hashes={} trailing_block_bytes={}",
             block.transactions.len(),
             block_reader.len()
@@ -1555,7 +1504,7 @@ mod tests {
             let mut tx_reader: &[u8] = first_tx.blob.as_slice();
             let tx = Transaction::<NotPruned>::read(&mut tx_reader)
                 .unwrap_or_else(|e| panic!("first tx decode failed: {e}"));
-            eprintln!(
+            walletcore_diagnostic!(
                 "first tx trailing_bytes={} prunable_hash_present={} computed_prunable_hash_present={}",
                 tx_reader.len(),
                 first_tx.prunable_hash.is_some(),

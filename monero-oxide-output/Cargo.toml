@@ -9,6 +9,8 @@ name = "monerowalletcore"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
+# Never enabled in distributed artifacts. Requires WALLETCORE_DIAGNOSTICS=1 at runtime too.
+diagnostic-logging = []
 # Enable scanner micro-profiler plumbing (compile-time + runtime).
 # Runtime toggle is controlled via env var: MONERO_WALLET_SCANNER_MICROPROF=1
 scanner-microprof = []
